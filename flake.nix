@@ -40,7 +40,10 @@
           {
             nixpkgs.config.allowUnfree = true;
             boot.loader.grub.enable = false;
-            fileSystems."/".device = "nodev";
+            fileSystems."/" = {
+              device = "none";
+              fsType = "tmpfs";
+            };
             system.stateVersion = "26.05";
             services.vllm-sm70 = {
               enable = true;
