@@ -111,6 +111,7 @@ ipython_config.py
 
 # uv
 uv.lock
+!nix/pyenv/uv.lock
 
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is

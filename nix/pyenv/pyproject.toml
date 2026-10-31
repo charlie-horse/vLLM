@@ -1,0 +1,53 @@
+[project]
+name = "c4130-vllm-env"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+  "1cat-vllm",
+  "torch==2.10.0",
+  "torchvision==0.25.0",
+  "torchaudio==2.10.0",
+  "huggingface-hub[hf-xet]",
+  "lmcache",
+]
+
+[dependency-groups]
+# Build-only: lmcache's setup.py compiles its .proto files (not in the runtime venv).
+lmcache-build = ["grpcio-tools"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# PyPI only has CUDA 13 wheels for lmcache; force the sdist (built in package.nix).
+no-binary-package = ["lmcache"]
+
+# LMCache 0.5.6 built for CUDA 12 (LMCACHE_CUDA_MAJOR=12; CUDA 13 can't target
+# Volta). Metadata is declared here so locking doesn't build the sdist, and its
+# conservative upper bounds on numpy / prometheus / opentelemetry are relaxed to
+# the versions 1Cat requires. pytest (a test-only leftover) is dropped.
+[[tool.uv.dependency-metadata]]
+name = "lmcache"
+version = "0.5.6"
+requires-dist = [
+  "aiofile", "aiofiles", "blake3", "aiohttp", "awscrt", "cryptography",
+  "cufile-python", "fastapi", "httpx", "huggingface_hub>=1.5.0", "msgspec",
+  "numpy", "numba", "nvtx",
+  "opentelemetry-api>=1.20.0", "opentelemetry-sdk>=1.20.0",
+  "opentelemetry-exporter-otlp>=1.20.0", "opentelemetry-exporter-prometheus>=0.50b0",
+  "prometheus_client>=0.18.0", "psutil", "py-cpuinfo", "pyyaml", "pyzmq>=25.0.0",
+  "grpcio>=1.78.0", "grpcio-observability>=1.78.0", "protobuf>=6.31.1,<7",
+  "redis", "safetensors", "setuptools>=77.0.3,<81.0.0", "setuptools_scm>=8",
+  "sortedcontainers", "torch", "transformers>=5.4", "uvicorn", "httptools",
+  "cachetools", "google-api-core", "google-cloud-bigtable",
+  "cupy-cuda12x", "cuda-python>=12,<13",
+]
+
+[tool.uv.sources]
+1cat-vllm = { url = "https://github.com/1CatAI/1Cat-vLLM/releases/download/v1.5.1/1cat_vllm-1.5.1-cp312-cp312-linux_x86_64.whl" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
