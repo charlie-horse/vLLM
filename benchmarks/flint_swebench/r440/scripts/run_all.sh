@@ -18,7 +18,7 @@ flock -n 8 || { echo "$(date '+%F %T') driver att$A already running"; exit 1; }
 log() { echo "$(date '+%F %T') [driver att$A] $*"; }
 "$R/scripts/podman_service.sh" || { log "podman service failed"; exit 1; }
 if ! pgrep -f "$R/scripts/watchdog.sh" >/dev/null; then
-  nohup setsid "$R/scripts/watchdog.sh" > /dev/null 2>&1 < /dev/null &
+  nohup setsid "$R/scripts/watchdog.sh" > /dev/null 2>&1 < /dev/null 8>&- &
   WD=$!
 fi
 log "start: $(grep -c . "$IDS") ids from $IDS"
