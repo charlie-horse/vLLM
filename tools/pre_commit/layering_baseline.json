@@ -212,7 +212,7 @@
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
   "model": 2,
-  "platform": 37
+  "platform": 12
  },
  "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
   "platform": 1
