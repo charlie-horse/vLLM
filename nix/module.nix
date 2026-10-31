@@ -7,6 +7,10 @@
 #     activeModel = "flint";
 #     firewallInterfaces = [ "eno1" "tailscale0" ];
 #   };
+#   services.lmcache-sm70.ui.firewallInterfaces = [ "eno1" "tailscale0" ];
+#
+# LMCache is its own module (./lmcache.nix); this one imports it, enables it
+# when the active model has `lmcache = true` and passes the chunk size.
 #
 # Switch models by setting `activeModel` and running nixos-rebuild switch.
 # `inputs` are this flake's inputs and `src` the serving tree's source; both
@@ -15,16 +19,16 @@
 {
   config,
   lib,
-  pkgs,
+  vllmSm70Packages,
   ...
 }:
 let
   cfg = config.services.vllm-sm70;
+  lcfg = config.services.lmcache-sm70;
 
-  inherit (import ./package.nix { inherit pkgs lib inputs src; })
+  inherit (vllmSm70Packages)
     vllm
     vllmFlint
-    lmcacheUi
     flintCheckpoint
     ;
 
@@ -32,21 +36,6 @@ let
   # systemd StateDirectory of the vllm user (the units say "vllm").
   stateDir = "/var/lib/vllm";
   modelsDir = "${stateDir}/models";
-
-  # KV cache tiers below the GPU: LMCache L1 in pinned CPU RAM, L2 on local disk.
-  # LMCache doesn't evict L2 on its own (that needs its fleet coordinator), so
-  # vllm-lmcache-l2-prune keeps the directory under l2SizeGb, least recently
-  # accessed first; fs_native checks files on every lookup, so pruned chunks
-  # are just misses.
-  kvTiers = {
-    inherit (cfg.kvTiers) l1SizeGb l2SizeGb;
-    l2Dir = "/var/lib/lmcache/l2";
-    port = 5555;
-    # The MP server's admin API (no authentication, so loopback only) and the
-    # dashboard that renders it.
-    httpPort = 8080;
-    uiPort = 8081;
-  };
 
   # DFlash2 speculative decoding with a local draft checkpoint, per 1Cat's
   # release profile (draft KV follows the target's FP16 KV).
@@ -200,50 +189,11 @@ let
       kv_load_failure_policy = "recompute";
       kv_connector_extra_config = {
         "lmcache.mp.host" = "tcp://127.0.0.1";
-        "lmcache.mp.port" = kvTiers.port;
+        "lmcache.mp.port" = lcfg.port;
       };
     })
   ]
   ++ model.args;
-
-  lmcacheArgs = [
-    "server"
-    "--host" "127.0.0.1"
-    "--port" (toString kvTiers.port)
-    "--http-host" "127.0.0.1"
-    # Already the default, but vllm-lmcache-ui points at this port.
-    "--http-port" (toString kvTiers.httpPort)
-    # One object group per attention type, required for hybrid GDN models.
-    "--separate-object-groups"
-    # Must be a multiple of the active model's vLLM block size.
-    "--chunk-size" (toString model.lmcacheChunkSize)
-    "--l1-size-gb" (toString kvTiers.l1SizeGb)
-    "--eviction-policy" "LRU"
-    "--l2-adapter"
-    (builtins.toJSON {
-      type = "fs_native";
-      base_path = kvTiers.l2Dir;
-      num_workers = 8;
-      max_capacity_gb = kvTiers.l2SizeGb;
-    })
-  ];
-
-  # LMCache's dashboard is a read-only proxy in front of the MP server's admin
-  # API: `--nodes` is both the node list it renders and the allowlist its
-  # /proxy/{host}/{port}/... route checks against.
-  uiArgs = [
-    "--host" "0.0.0.0"
-    "--port" (toString kvTiers.uiPort)
-    "--nodes"
-    (builtins.toJSON [
-      {
-        name = "lmcache_server";
-        host = "127.0.0.1";
-        port = toString kvTiers.httpPort;
-      }
-    ])
-    "--log-level" "warning"
-  ];
 
   env = {
     HOME = stateDir;
@@ -258,23 +208,17 @@ let
 in
 {
   imports = [
+    (import ./packages-module.nix { inherit inputs src; })
+    (import ./lmcache.nix { inherit inputs src; })
     # The options lived under c4130.vllm while this module was host config.
     (lib.mkRenamedOptionModule
       [ "c4130" "vllm" "activeModel" ]
       [ "services" "vllm-sm70" "activeModel" ]
     )
-    (lib.mkRenamedOptionModule
-      [ "c4130" "vllm" "kvTiers" "l1SizeGb" ]
-      [ "services" "vllm-sm70" "kvTiers" "l1SizeGb" ]
-    )
-    (lib.mkRenamedOptionModule
-      [ "c4130" "vllm" "kvTiers" "l2SizeGb" ]
-      [ "services" "vllm-sm70" "kvTiers" "l2SizeGb" ]
-    )
   ];
 
   options.services.vllm-sm70 = {
-    enable = lib.mkEnableOption "the vLLM server on two V100s (TP=2) with LMCache";
+    enable = lib.mkEnableOption "the vLLM server on two V100s (TP=2)";
 
     activeModel = lib.mkOption {
       type = lib.types.enum (lib.attrNames cfg.models);
@@ -306,29 +250,22 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       example = [ "eno1" "tailscale0" ];
-      description = ''
-        Interfaces on which the API port (and the LMCache dashboard, when
-        LMCache is on) is opened. Neither authenticates.
-      '';
+      description = "Interfaces on which the API port is opened (no authentication).";
     };
 
-    # Lower both to run LMCache alongside something else that wants the RAM or
-    # the disk; L1 is pinned and allocated in full at startup.
-    kvTiers.l1SizeGb = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 64;
-      description = "LMCache L1 size in GB (pinned CPU RAM).";
-    };
-
-    kvTiers.l2SizeGb = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 180;
-      description = "LMCache L2 cap in GB (local disk, enforced by vllm-lmcache-l2-prune).";
-    };
   };
 
   config = lib.mkIf cfg.enable {
     services.vllm-sm70.models = lib.mapAttrs (_: lib.mkDefault) builtinModels;
+
+    # The model's `lmcache` field is the switch; set it there, not here.
+    services.lmcache-sm70 = {
+      enable = lmcache;
+      user = "vllm";
+      homeStateDirectory = "vllm";
+      environment = env;
+      chunkSize = lib.mkIf lmcache model.lmcacheChunkSize;
+    };
 
     environment.systemPackages = [ vllm ];
 
@@ -377,74 +314,6 @@ in
       };
     };
 
-    # LMCache MP server: holds L1/L2 and copies KV to/from vLLM over CUDA IPC,
-    # so it runs as the same user with GPU access.
-    systemd.services.vllm-lmcache = lib.mkIf lmcache {
-      description = "LMCache KV cache server (L1 ${toString kvTiers.l1SizeGb} GB RAM, L2 ${toString kvTiers.l2SizeGb} GB disk)";
-      after = [ "nvidia-persistenced.service" ];
-      environment = env;
-      serviceConfig = {
-        User = "vllm";
-        Group = "vllm";
-        SupplementaryGroups = [ "video" ];
-        StateDirectory = [ "vllm" "lmcache" "lmcache/l2" ];
-        ExecStart = "${vllm}/bin/lmcache ${lib.escapeShellArgs lmcacheArgs}";
-        Restart = "on-failure";
-        RestartSec = 10;
-        LimitMEMLOCK = "infinity";
-      };
-    };
-
-    # LMCache's own dashboard (lmcache.lmcache_frontend). It only talks HTTP to
-    # the MP server's admin API, so it needs no GPU and no cache state of its own.
-    systemd.services.vllm-lmcache-ui = lib.mkIf lmcache {
-      description = "LMCache dashboard (port ${toString kvTiers.uiPort})";
-      wantedBy = [ "multi-user.target" ];
-      requires = [ "vllm-lmcache.service" ];
-      after = [ "vllm-lmcache.service" ];
-      environment = env;
-      serviceConfig = {
-        User = "vllm";
-        Group = "vllm";
-        # Importing lmcache probes for a compute backend.
-        SupplementaryGroups = [ "video" ];
-        StateDirectory = "vllm";
-        ExecStart = "${lmcacheUi}/bin/python -m lmcache.lmcache_frontend.app ${lib.escapeShellArgs uiArgs}";
-        Restart = "on-failure";
-        RestartSec = 10;
-      };
-    };
-
-    systemd.services.vllm-lmcache-l2-prune = {
-      description = "Keep LMCache L2 under ${toString kvTiers.l2SizeGb} GB";
-      path = [ pkgs.coreutils pkgs.findutils pkgs.gawk ];
-      serviceConfig = {
-        Type = "oneshot";
-        User = "vllm";
-        Group = "vllm";
-      };
-      # Above 90% of the cap, delete least recently accessed files down to 80%.
-      script = ''
-        dir=${kvTiers.l2Dir}
-        [ -d "$dir" ] || exit 0
-        cap=$(( ${toString kvTiers.l2SizeGb} * 1024 * 1024 * 1024 ))
-        used=$(du -sb "$dir" | cut -f1)
-        [ "$used" -gt $(( cap * 9 / 10 )) ] || exit 0
-        excess=$(( used - cap * 8 / 10 ))
-        find "$dir" -type f -printf '%A@ %s %p\n' | sort -n \
-          | awk -v excess="$excess" 'freed >= excess { exit } { print $3; freed += $2 }' \
-          | xargs -r -d '\n' rm -f --
-      '';
-    };
-
-    systemd.timers.vllm-lmcache-l2-prune = {
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnBootSec = "2min";
-        OnUnitActiveSec = "1min";
-      };
-    };
-
     systemd.services.vllm = {
       description = "vLLM OpenAI-compatible server (${active})";
       wantedBy = [ "multi-user.target" ];
@@ -467,9 +336,9 @@ in
       };
     };
 
-    # Neither port authenticates; the host relies on network policy.
+    # No authentication; the host relies on network policy.
     networking.firewall.interfaces = lib.genAttrs cfg.firewallInterfaces (_: {
-      allowedTCPPorts = [ port ] ++ lib.optional lmcache kvTiers.uiPort;
+      allowedTCPPorts = [ port ];
     });
   };
 }

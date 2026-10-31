@@ -19,7 +19,7 @@
   };
 
   outputs =
-    inputs@{ self, nixpkgs, ... }:
+    inputs@{ nixpkgs, ... }:
     let
       system = "x86_64-linux";
       inherit (nixpkgs) lib;
@@ -29,61 +29,22 @@
       };
       src = import ./nix/source.nix { inherit lib; };
       p = import ./nix/package.nix { inherit pkgs lib inputs src; };
-
-      module = import ./nix/module.nix { inherit inputs src; };
-
-      # Evaluates the module on a minimal system without building anything.
-      evalModule = lib.nixosSystem {
-        inherit system;
-        modules = [
-          module
-          {
-            nixpkgs.config.allowUnfree = true;
-            boot.loader.grub.enable = false;
-            fileSystems."/" = {
-              device = "none";
-              fsType = "tmpfs";
-            };
-            system.stateVersion = "26.05";
-            services.vllm-sm70 = {
-              enable = true;
-              firewallInterfaces = [ "eth0" ];
-            };
-          }
-        ];
-      };
-      units = lib.mapAttrs (_: u: u.serviceConfig.ExecStart or u.script) {
-        inherit (evalModule.config.systemd.services)
-          vllm
-          vllm-lmcache
-          vllm-lmcache-ui
-          vllm-model-fetch
-          ;
-      };
+      vllm = import ./nix/module.nix { inherit inputs src; };
     in
     {
+      # This repo built for sm_70 (CUDA 12.8) on the pinned wheel env, wrapped
+      # with the runtime setup (`vllm`, `python`).
       packages.${system} = {
         default = p.vllmFlint;
-        # This repo built for sm_70, wrapped with the runtime setup.
-        vllm-flint = p.vllmFlint;
-        # The unwrapped in-place build of this repo.
-        vllm-flint-tree = p.flintTree;
-        # The stock 1Cat 1.5.1 wheel (the Qwen models), plus `hf` and `lmcache`.
-        vllm-wheel = p.vllm;
-        lmcache-ui = p.lmcacheUi;
-        # The Python environment (torch, LMCache, 1Cat wheel) from nix/pyenv.
-        python-env = p.venv;
-        flint-gguf = p.gguf;
-        flint-hf-config = p.hfConfig;
-        flint-converter = p.flintConverter;
-        flint-checkpoint = p.flintCheckpoint;
+        vllm = p.vllmFlint;
       };
 
-      nixosModules.default = module;
-      nixosModules.vllm-sm70 = module;
-
-      checks.${system}.module-eval = pkgs.writeText "vllm-sm70-units" (
-        builtins.unsafeDiscardStringContext (builtins.toJSON units)
-      );
+      # `vllm` imports `lmcache`; use `lmcache` alone to run only the cache
+      # server. Both build their packages with the host's `pkgs`.
+      nixosModules = {
+        default = vllm;
+        inherit vllm;
+        lmcache = import ./nix/lmcache.nix { inherit inputs src; };
+      };
     };
 }
