@@ -10,13 +10,6 @@ import torch.nn.functional as F
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
-from vllm.diagnostics import (
-    diagnostic_channel,
-    flush_layer_buffers,
-    layer_dump_requested,
-    legacy_channel,
-    record_layer_tensor,
-)
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -48,6 +41,9 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+from vllm.model_executor.layers.fused_moe.runner.sm70_moe_runner_dump import (
+    dump_moe_runner_tensor,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
@@ -56,64 +52,6 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
-_SM70_MOE_RUNNER_DUMP_BUFFERS = legacy_channel("moe_runner").buffers
-_SM70_MOE_RUNNER_DUMP_META = legacy_channel("moe_runner").metadata
-
-
-def _sm70_extract_moe_layer_idx(layer_name: str) -> int:
-    parts = layer_name.split(".")
-    for idx, part in enumerate(parts[:-1]):
-        if part == "layers":
-            try:
-                return int(parts[idx + 1])
-            except ValueError:
-                return -1
-    return -1
-
-
-def _sm70_moe_runner_dump_requested(layer_idx: int, label: str) -> bool:
-    return layer_dump_requested(layer_idx, label, moe=True)
-
-
-def _sm70_moe_runner_dump_token_count_allowed(tensor: torch.Tensor) -> bool:
-    return diagnostic_channel("moe_runner").policy.allows_tokens(tensor)
-
-
-def _sm70_moe_runner_dump_impl(
-    tensor: torch.Tensor, label: str, layer_idx: int
-) -> torch.Tensor:
-    return record_layer_tensor(tensor, label, layer_idx, "moe_runner", moe=True)
-
-
-def _sm70_moe_runner_dump_fake(
-    tensor: torch.Tensor,
-    label: str,
-    layer_idx: int,
-) -> torch.Tensor:
-    return tensor
-
-
-direct_register_custom_op(
-    op_name="sm70_moe_runner_dump",
-    op_func=_sm70_moe_runner_dump_impl,
-    mutates_args=[],
-    fake_impl=_sm70_moe_runner_dump_fake,
-)
-
-
-def _sm70_dump_moe_runner_tensor(
-    tensor: torch.Tensor,
-    label: str,
-    layer_name: str,
-) -> torch.Tensor:
-    layer_idx = _sm70_extract_moe_layer_idx(layer_name)
-    if _sm70_moe_runner_dump_requested(layer_idx, label):
-        tensor = torch.ops.vllm.sm70_moe_runner_dump(tensor, label, layer_idx)
-    return tensor
-
-
-def dump_sm70_moe_runner_graph_buffers(step: int, stage: str) -> None:
-    flush_layer_buffers(step, stage, moe=True)
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
@@ -709,12 +647,12 @@ class MoERunner(MoERunnerInterface):
                     router_logits=router_logits,
                     input_ids=input_ids,
                 )
-            topk_weights = _sm70_dump_moe_runner_tensor(
+            topk_weights = dump_moe_runner_tensor(
                 topk_weights,
                 "moe_topk_weights",
                 self.layer_name,
             )
-            topk_ids = _sm70_dump_moe_runner_tensor(
+            topk_ids = dump_moe_runner_tensor(
                 topk_ids,
                 "moe_topk_ids",
                 self.layer_name,
@@ -736,7 +674,7 @@ class MoERunner(MoERunnerInterface):
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
         )
 
-        fused_out = _sm70_dump_moe_runner_tensor(
+        fused_out = dump_moe_runner_tensor(
             fused_out,
             "moe_fused_raw",
             self.layer_name,
@@ -745,7 +683,7 @@ class MoERunner(MoERunnerInterface):
             self._shared_experts.output if self._shared_experts is not None else None
         )
         if shared_out is not None:
-            shared_out = _sm70_dump_moe_runner_tensor(
+            shared_out = dump_moe_runner_tensor(
                 shared_out,
                 "moe_shared_raw",
                 self.layer_name,
@@ -868,7 +806,7 @@ class MoERunner(MoERunnerInterface):
         # See note above re: the two all-reduce points.
         shared_output = self._maybe_reduce_shared_expert_output(shared_output)
         if shared_output is not None:
-            shared_output = _sm70_dump_moe_runner_tensor(
+            shared_output = dump_moe_runner_tensor(
                 shared_output,
                 "moe_shared_reduced",
                 self.layer_name,
@@ -877,13 +815,13 @@ class MoERunner(MoERunnerInterface):
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
         )
-        fused_output = _sm70_dump_moe_runner_tensor(
+        fused_output = dump_moe_runner_tensor(
             fused_output,
             "moe_fused_scaled",
             self.layer_name,
         )
         if shared_output is not None:
-            shared_output = _sm70_dump_moe_runner_tensor(
+            shared_output = dump_moe_runner_tensor(
                 shared_output,
                 "moe_shared_scaled",
                 self.layer_name,
@@ -891,7 +829,7 @@ class MoERunner(MoERunnerInterface):
 
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
-        fused_output = _sm70_dump_moe_runner_tensor(
+        fused_output = dump_moe_runner_tensor(
             fused_output,
             "moe_fused_projected",
             self.layer_name,
@@ -937,7 +875,7 @@ class MoERunner(MoERunnerInterface):
             shared_output, fused_output, og_hidden_dim
         )
         if result is not None:
-            result = _sm70_dump_moe_runner_tensor(
+            result = dump_moe_runner_tensor(
                 result,
                 "moe_sum2_output",
                 self.layer_name,
@@ -948,14 +886,14 @@ class MoERunner(MoERunnerInterface):
             result = shared_output + fused_output
         else:
             result = fused_output
-        result = _sm70_dump_moe_runner_tensor(
+        result = dump_moe_runner_tensor(
             result,
             "moe_added_output",
             self.layer_name,
         )
 
         result = self._maybe_reduce_final_output(result, og_hidden_dim)
-        result = _sm70_dump_moe_runner_tensor(
+        result = dump_moe_runner_tensor(
             result,
             "moe_final_output",
             self.layer_name,
@@ -1065,7 +1003,7 @@ class MoERunner(MoERunnerInterface):
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
                 router_logits, _ = self.gate(hidden_states)
-            router_logits = _sm70_dump_moe_runner_tensor(
+            router_logits = dump_moe_runner_tensor(
                 router_logits,
                 "moe_router_logits",
                 self.layer_name,
