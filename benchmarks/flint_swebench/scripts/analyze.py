@@ -39,6 +39,11 @@ Categories (exactly one per instance, first match wins):
                          pull/build failure, docker error, 429/rate limit, or the
                          test run timed out (use --timeout-is-model to count test
                          timeouts as wrong_patch instead).
+  runner_infra_error     done_ID carries an "infra" field (r440 run_one.sh writes
+                         "pull_failed" | "api_failed"); takes precedence over all.
+  api_infra_error        endpoint failures that are not the model's fault: exit
+                         status APIConnectionError/APIError/Timeout/5xx/
+                         RateLimitError, or any 429 / rate-limit text.
   agent_infra_error      agent never ran because the sandbox failed (docker run /
                          image pull error, no trajectory). Excluded like eval infra.
   context_overflow       API rejected the prompt for context length (400 "maximum
@@ -49,7 +54,7 @@ Categories (exactly one per instance, first match wins):
   no_patch_or_step_limit empty submission with LimitsExceeded / TimeExceeded /
                          Submitted-but-empty / agent timeout (6h `timeout`).
   format_tool_error      RepeatedFormatError, FormatError, or a non-context model API
-                         exception (BadRequest, APIConnectionError, Timeout, 5xx...).
+                         exception (e.g. non-context BadRequestError).
   other:<exit_status>    anything else (inspect manually).
 Infra categories are excluded from the pass@1 denominator and reported separately.
 
@@ -75,7 +80,8 @@ from pathlib import Path
 
 import numpy as np
 
-INFRA = ("eval_infra_error", "agent_infra_error")
+INFRA = ("runner_infra_error", "api_infra_error", "eval_infra_error",
+         "agent_infra_error")
 CATEGORIES = (
     "resolved",
     "wrong_patch",
@@ -84,6 +90,8 @@ CATEGORIES = (
     "format_tool_error",
     "eval_infra_error",
     "agent_infra_error",
+    "api_infra_error",
+    "runner_infra_error",
 )
 
 CONTEXT_RE = re.compile(
@@ -93,9 +101,17 @@ CONTEXT_RE = re.compile(
     r"|input tokens exceed|too many tokens",
     re.I,
 )
+# Transient endpoint failures (run_one.sh API_RE + rate limits): never the model's
+# fault -> api_infra_error (excluded). Matched on the exit status / exception text.
+API_INFRA_STATUSES = {
+    "APIConnectionError", "APIError", "Timeout", "InternalServerError",
+    "ServiceUnavailableError", "BadGatewayError", "APIResponseValidationError",
+    "RateLimitError",
+}
+RATE_LIMIT_RE = re.compile(r"RateLimitError|\b429\b|Too Many Requests|rate limit", re.I)
 API_ERR_RE = re.compile(
     r"BadRequestError|APIConnectionError|APIError|InternalServerError|Timeout"
-    r"|ServiceUnavailable|RateLimitError|litellm\.|openai\.",
+    r"|ServiceUnavailable|litellm\.|openai\.",
 )
 FORMAT_STATUSES = {"RepeatedFormatError", "FormatError"}
 LIMIT_STATUSES = {"LimitsExceeded", "TimeExceeded", "Submitted", "StepLimitExceeded"}
@@ -205,6 +221,8 @@ def eval_info(att_dir: Path, a: int, iid: str) -> dict:
 # -------------------------------------------------------------- classification
 def classify(rec: dict, ev: dict, timeout_is_model: bool) -> tuple[str, str]:
     status = rec["exit_status"] or ""
+    if rec.get("infra"):  # runner-declared infra (done_ID "infra"): always wins
+        return "runner_infra_error", str(rec["infra"])
     patch = rec["patch"]
     rr, ir = ev["run_report"], ev["inst_report"]
     resolved = bool(ir and ir.get("resolved")) or bool(
@@ -246,6 +264,10 @@ def classify(rec: dict, ev: dict, timeout_is_model: bool) -> tuple[str, str]:
         return "agent_infra_error", status or AGENT_INFRA_RE.search(exc_text).group(0)
     if not rec["has_traj"] and (rec.get("agent_s") or 0) >= 6 * 3600 - 60:
         return "no_patch_or_step_limit", "agent_timeout_6h"
+    if status in API_INFRA_STATUSES:
+        return "api_infra_error", status
+    if RATE_LIMIT_RE.search(err_text):
+        return "api_infra_error", status or "rate_limited_429"
     if API_ERR_RE.search(exc_text):
         return "format_tool_error", status or API_ERR_RE.search(exc_text).group(0)
     return f"other:{status or 'no_exit_status'}", ""
@@ -279,6 +301,7 @@ def collect(runs: Path, attempts: list[int] | None, include_pending: bool,
                 for x in msgs[-2:] if x.get("role") == "exit")
             rec = dict(
                 id=iid, attempt=a, repo=repo_of(iid), done=done is not None,
+                infra=(done or {}).get("infra"),
                 exit_status=info.get("exit_status")
                 or exit_status_from_yaml(agent_dir, iid),
                 exception_str=info.get("exception_str"),
@@ -446,6 +469,10 @@ def to_markdown(S: dict) -> str:
     for repo, v in S["per_repo"].items():
         L.append(f"| {repo} | {v.get('resolved', 0)} | {v.get('attempted', 0)} "
                  f"| {pct(v['rate'])} | {v.get('infra', 0)} |")
+    infra = [r for r in S["instances"] if r["category"] in INFRA]
+    L += ["", "## Infra-excluded (not in denominator)", ""]
+    L += [f"- att{r['attempt']} {r['id']}: {r['category']} ({r['detail'] or '?'})"
+          for r in infra] or ["- none"]
     L += ["", "## Categories", "", "| category | count |", "|---|---|"]
     for c, n in sorted(S["categories"].items(), key=lambda x: -x[1]):
         L.append(f"| {c} | {n} |")
