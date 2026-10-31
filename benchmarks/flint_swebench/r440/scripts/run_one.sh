@@ -62,7 +62,7 @@ pulled=0
 for d in "${PULL_BACKOFF[@]}"; do
   if [ "$d" -gt 0 ]; then log "pull failed, retry in $((d / 60)) min"; sleep "$d"; fi
   if podman image exists "$IMG" || pull_once; then pulled=1; break; fi
-  if tail -5 "$LOG" | grep -qiE 'manifest unknown|not found|name unknown'; then
+  if tail -5 "$LOG" | grep -qiE 'manifest unknown|name unknown|repository does not exist'; then
     log "image does not exist upstream"; break
   fi
 done
