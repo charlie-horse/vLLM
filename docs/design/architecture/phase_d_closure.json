@@ -79,11 +79,11 @@
       ],
       "containers": [
         {
-          "path": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "path": "vllm/model_executor/layers/fused_moe/runner/sm70_moe_runner_dump.py",
           "name": "_SM70_MOE_RUNNER_DUMP_BUFFERS"
         },
         {
-          "path": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "path": "vllm/model_executor/layers/fused_moe/runner/sm70_moe_runner_dump.py",
           "name": "_SM70_MOE_RUNNER_DUMP_META"
         },
         {

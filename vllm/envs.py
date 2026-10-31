@@ -18423,8 +18423,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "ayer_graph_buffers"
             ),
             (
-                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
-                ":dump_sm70_moe_runner_graph_buffers"
+                "None at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:dump_sm70_moe_runner_graph_buffers"
             ),
             (
                 "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
@@ -18461,16 +18461,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "dump_awq_moe_buffer_requested"
             ),
             (
-                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
-                ":_sm70_moe_runner_dump_impl"
+                "None at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:_sm70_moe_runner_dump_impl"
             ),
             (
-                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
-                ":dump_sm70_moe_runner_graph_buffers"
+                "None at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:dump_sm70_moe_runner_graph_buffers"
             ),
             (
-                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
-                ":_sm70_moe_runner_dump_requested"
+                "None at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:_sm70_moe_runner_dump_requested"
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
@@ -18531,8 +18531,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "_dump_impl"
             ),
             (
-                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
-                ":_sm70_moe_runner_dump_impl"
+                "None at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:_sm70_moe_runner_dump_impl"
             ),
             (
                 "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
@@ -18557,8 +18557,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "ayer_graph_buffers"
             ),
             (
-                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
-                ":dump_sm70_moe_runner_graph_buffers"
+                "None at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:dump_sm70_moe_runner_graph_buffers"
             ),
             (
                 "None at vllm/v1/worker/gpu_model_runner.py:_maybe_dump_sm70_qwen_"
@@ -18609,8 +18609,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "ump_impl"
             ),
             (
-                "'' at vllm/model_executor/layers/fused_moe/runner/moe_runner.py:_"
-                "sm70_moe_runner_dump_requested"
+                "'' at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:_sm70_moe_runner_dump_requested"
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
@@ -18649,8 +18649,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "_dump_token_count_allowed"
             ),
             (
-                "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
-                ":_sm70_moe_runner_dump_token_count_allowed"
+                "None at vllm/model_executor/layers/fused_moe/runner/"
+                "sm70_moe_runner_dump.py:_sm70_moe_runner_dump_token_count_allowed"
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
