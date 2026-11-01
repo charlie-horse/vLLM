@@ -30,8 +30,12 @@ done_marker() {  # $1 = infra reason or empty
     > "$REPORT"
 }
 cleanup_image() {
-  podman rmi -f "$IMG" >/dev/null 2>&1
-  podman image prune -f >/dev/null 2>&1
+  # Hold the pull lock so pruning cannot drop shared layers mid-pull.
+  (
+    flock 9
+    podman rmi -f "$IMG" >/dev/null 2>&1
+    podman image prune -f >/dev/null 2>&1
+  ) 9>"$ST/pull.lock"
 }
 memkilled() { [ -f "$ST/memkill_$ID" ]; }
 finish_memkill() {
