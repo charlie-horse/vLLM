@@ -197,7 +197,8 @@ cython_debug/
 .vscode/
 
 # Claude
-.claude/
+.claude/*
+!.claude/settings.json
 
 # Codex
 .codex/
