@@ -46,8 +46,26 @@ sampling noise.
 - Sampling (client): temperature 1.0, top_p 0.95, max_tokens 65536 (the
   NVFP4 card's client budget; the card's minimum is 32768). top_k 20 comes
   from the server default. Context length 262144.
-- Server: vLLM fork at {{VLLM_COMMIT}}, `max-num-seqs 2`, serve command:
-  {{SERVE_CMD}}.
+- Server: this fork, Nix flake input locked at `b7b1753` (= main `c52fd8d`
+  plus `nix/` packaging), built for sm_70 / CUDA 12.8. 2x Tesla
+  V100-PCIe-32GB, no NVLink, TP2, host c4130. Same config for the whole
+  run (the Sat 12:44 EDT restart changed only the LMCache disk cap).
+- Weights: RecursiveSI/flint NVFP4 GGUF, repacked losslessly to a ModelOpt
+  NVFP4 W4A16 checkpoint (`vllm.models.flint.convert_gguf` at `f66728d`):
+  E2M1 weights and E4M3 block scales unchanged, BF16 tensors cast to FP16
+  (range-checked). FP16 overflow is avoided with exact power-of-two shifts
+  from layer 46 (MoE intermediate /16, residual stream /8).
+- Serve args: `--tensor-parallel-size 2 --dtype half --max-model-len 262144
+  --max-num-seqs 2 --max-num-batched-tokens 8192
+  --gpu-memory-utilization 0.90 --enable-prefix-caching
+  --enable-auto-tool-choice --kv-cache-dtype auto
+  --kernel-config.sm70_skinny_moe false --enable-prompt-tokens-details
+  --tool-call-parser glm47 --reasoning-parser glm47
+  --exclude-tools-when-tool-choice-none --override-generation-config
+  '{"temperature":1.0,"top_p":0.95,"top_k":20}' --served-model-name flint`,
+  async scheduling on. KV offload via LMCache (MP connector, chunk 256,
+  64 GB host RAM L1, disk L2 180 GB then 100 GB, recompute on load
+  failure). Decode: 178 tok/s single stream at 4K context.
 - Reasoning round-trip (card requirement: keep reasoning in the history).
   The server returns `message.reasoning` (not `reasoning_content`). Stock
   mini-swe-agent 2.4.6 + litellm 1.106.6 already preserve it. The adapter
@@ -201,7 +219,7 @@ are in the infra-excluded list.
 |---|---|---|
 | Oct 31 ~10:38 | vLLM restart (switch window) | Ridden out by per-call retries (~20 min), then up to 2 re-runs |
 | Oct 31 12:44–12:47 | vLLM restart (LMCache cap change) | Same |
-| {{K8S_ROLLOUT_TIME}} | k8s rollout on r440 | {{K8S_ROLLOUT_HANDLING}} |
+| Oct 31 ~13:20–14:15 | k8s rollout on r440 (cri-o to containerd, firewall reloads) | No effect: rootless podman is independent of cri-o; 0 infra errors |
 | Oct 31 (smoke run) | Watchdog inherited the driver's lock fd and blocked the next driver start | Fixed: fd 8 closed for the watchdog (`1107909`) |
 | Oct 31 13:36 | matplotlib image pulls failed on high-UID files | Fixed: overlay `ignore_chown_errors=true` (`b20d887`) |
 | Oct 31 17:03 | `pytest-dev__pytest-7432`: transient layer error matched as missing image | Fixed match (`c1bd2a1`); instance re-queued |
@@ -223,7 +241,7 @@ fb1e808 Add SWE-bench Verified harness for Flint (mini-swe-agent)
 Files: `benchmarks/flint_swebench/` (r440 copies in `r440/`, installed on
 r440 as `~/flint-swebench/{env.sh,flint.yaml,conf/,scripts/,adapter/}`).
 
-1. Serve Flint (c4130, 2x V100): {{SERVE_CMD}}. The runner expects
+1. Serve Flint (c4130, 2x V100) with the serve args under Method. The runner expects
    `$FLINT_API_BASE/models` to list `flint`.
 2. Environment (r440):
 
