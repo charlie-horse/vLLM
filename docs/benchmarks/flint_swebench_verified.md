@@ -1,7 +1,6 @@
 # Flint on SWE-bench Verified (2x V100, NVFP4 W4A16)
 
-Status: DRAFT. Values in `{{...}}` are filled in from
-`scripts/analyze.py` once the run finishes.
+Status: FINAL. Numbers from `scripts/analyze.py` on the completed run.
 
 ## Summary
 
@@ -9,12 +8,12 @@ Status: DRAFT. Values in `{{...}}` are filled in from
   weights, FP16 activations.
 - SWE-bench Verified, 500 instances x 1 attempt, mini-swe-agent 2.4.6 with
   the official SWE-bench config, official swebench 5.0.2 evaluation.
-- pass@1: **{{PASS_AT_1}}** ({{RESOLVED}} / {{SCORED}} scored instances),
-  95% Wilson CI {{CI95_LO}} – {{CI95_HI}}.
-- {{INFRA_EXCLUDED}} instances excluded as infra failures (not counted against
+- pass@1: **74.2%** (371 / 500 scored instances),
+  95% Wilson CI 70.2% – 77.8%.
+- 0 instances excluded as infra failures (not counted against
   the model; listed in Results).
-- Model card claim: 74.2% (BF16). Difference: {{DELTA_PP}} pp.
-  {{ONE_LINE_VERDICT}}
+- Model card claim: 74.2% (BF16). Difference: 0.0 pp.
+  The NVFP4 W4A16 build on V100 matches the claim: the point estimate is identical and the CI contains 74.2%.
 
 ## Claim vs result
 
@@ -24,10 +23,10 @@ Status: DRAFT. Values in `{{...}}` are filled in from
 | Hardware | not stated | 2x V100 32 GB, TP2 |
 | Agent | mini-swe-agent (version, config, step limit not stated) | mini-swe-agent 2.4.6, official `swebench.yaml`, step limit 250 |
 | Attempts | average pass@1 over >= 5 attempts | 1 attempt per instance |
-| Instances | 500 | 500 ({{SCORED}} scored, {{INFRA_EXCLUDED}} infra-excluded) |
+| Instances | 500 | 500 (500 scored, 0 infra-excluded) |
 | Internet in task env | none | none (`--network=none`) |
 | Agent timeout | up to 5 h | 5 h container timeout |
-| pass@1 | 74.2% | {{PASS_AT_1}} (95% CI {{CI95_LO}} – {{CI95_HI}}) |
+| pass@1 | 74.2% | 74.2% (95% CI 70.2% – 77.8%) |
 
 Sources: huggingface.co/RecursiveSI/flint (model card) and the accompanying
 blog post. The blog states NVFP4 is within 0.7 pts of 16-bit across their
@@ -140,48 +139,50 @@ Audit by Nadia:
 - Leakage attempts seen in trajectories (`pip download` of newer releases,
   `git log --all`) were blocked: no network in the task container, and the
   repos in the images contain no fix commits.
-- {{EXTRA_VALIDITY_NOTES}}
+- All 6 context overflows hit at 191–196K prompt tokens: prompt + `max_tokens` 65536 exceeded the 262144 window. These are model failures (the agent's history grew too long); none were re-run.
+- No instance hit the 250-step limit; 494 of 500 agents submitted.
+- The 8 non-standard wrong patches (no tests collected, missing module, patch did not apply) are counted as model failures; manual audit pending.
 
 ## Results
 
-pass@1: {{PASS_AT_1}} ({{RESOLVED}} / {{SCORED}}), 95% Wilson CI
-{{CI95_LO}} – {{CI95_HI}}.
+pass@1: 74.2% (371 / 500), 95% Wilson CI
+70.2% – 77.8%.
 With eval test timeouts counted as model failures (`--timeout-is-model`):
-{{PASS_AT_1_TIMEOUT_IS_MODEL}}.
+74.2% (unchanged: no eval test timeouts).
 
 ### Per repo
 
 | Repo | Resolved | Scored | Rate | Infra-excluded |
 |---|---|---|---|---|
-| astropy/astropy | {{R_ASTROPY}} | {{N_ASTROPY}} | {{P_ASTROPY}} | {{I_ASTROPY}} |
-| django/django | {{R_DJANGO}} | {{N_DJANGO}} | {{P_DJANGO}} | {{I_DJANGO}} |
-| matplotlib/matplotlib | {{R_MPL}} | {{N_MPL}} | {{P_MPL}} | {{I_MPL}} |
-| mwaskom/seaborn | {{R_SEABORN}} | {{N_SEABORN}} | {{P_SEABORN}} | {{I_SEABORN}} |
-| pallets/flask | {{R_FLASK}} | {{N_FLASK}} | {{P_FLASK}} | {{I_FLASK}} |
-| psf/requests | {{R_REQUESTS}} | {{N_REQUESTS}} | {{P_REQUESTS}} | {{I_REQUESTS}} |
-| pydata/xarray | {{R_XARRAY}} | {{N_XARRAY}} | {{P_XARRAY}} | {{I_XARRAY}} |
-| pylint-dev/pylint | {{R_PYLINT}} | {{N_PYLINT}} | {{P_PYLINT}} | {{I_PYLINT}} |
-| pytest-dev/pytest | {{R_PYTEST}} | {{N_PYTEST}} | {{P_PYTEST}} | {{I_PYTEST}} |
-| scikit-learn/scikit-learn | {{R_SKLEARN}} | {{N_SKLEARN}} | {{P_SKLEARN}} | {{I_SKLEARN}} |
-| sphinx-doc/sphinx | {{R_SPHINX}} | {{N_SPHINX}} | {{P_SPHINX}} | {{I_SPHINX}} |
-| sympy/sympy | {{R_SYMPY}} | {{N_SYMPY}} | {{P_SYMPY}} | {{I_SYMPY}} |
-| **Total** | {{RESOLVED}} | {{SCORED}} | {{PASS_AT_1}} | {{INFRA_EXCLUDED}} |
+| astropy/astropy | 15 | 22 | 68.2% | 0 |
+| django/django | 180 | 231 | 77.9% | 0 |
+| matplotlib/matplotlib | 23 | 34 | 67.6% | 0 |
+| mwaskom/seaborn | 1 | 2 | 50.0% | 0 |
+| pallets/flask | 1 | 1 | 100.0% | 0 |
+| psf/requests | 3 | 8 | 37.5% | 0 |
+| pydata/xarray | 19 | 22 | 86.4% | 0 |
+| pylint-dev/pylint | 3 | 10 | 30.0% | 0 |
+| pytest-dev/pytest | 17 | 19 | 89.5% | 0 |
+| scikit-learn/scikit-learn | 28 | 32 | 87.5% | 0 |
+| sphinx-doc/sphinx | 27 | 44 | 61.4% | 0 |
+| sympy/sympy | 54 | 75 | 72.0% | 0 |
+| **Total** | 371 | 500 | 74.2% | 0 |
 
 ### Failure breakdown
 
 | Category | Count | Share of scored |
 |---|---|---|
-| Resolved | {{RESOLVED}} | {{PASS_AT_1}} |
-| Wrong patch (eval ran, not resolved) | {{N_WRONG_PATCH}} | {{S_WRONG_PATCH}} |
-| No patch or step/time limit | {{N_NO_PATCH}} | {{S_NO_PATCH}} |
-| Context overflow | {{N_CONTEXT}} | {{S_CONTEXT}} |
-| Format / tool errors | {{N_FORMAT}} | {{S_FORMAT}} |
-| Other (inspected manually) | {{N_OTHER}} | {{S_OTHER}} |
-| Infra, excluded | {{INFRA_EXCLUDED}} | n/a |
+| Resolved | 371 | 74.2% |
+| Wrong patch (eval ran, not resolved) | 123 | 24.6% |
+| No patch or step/time limit | 0 | 0.0% |
+| Context overflow | 6 | 1.2% |
+| Format / tool errors | 0 | 0.0% |
+| Other (inspected manually) | 0 | 0.0% |
+| Infra, excluded | 0 | n/a |
 
-Infra-excluded instances and reasons: {{INFRA_LIST}}
+Infra-excluded instances and reasons: none.
 
-Of the wrong patches, {{N_PATCH_APPLY_FAILED}} failed to apply.
+Of the wrong patches, 1 failed to apply.
 
 ## Cost
 
@@ -189,18 +190,18 @@ Per scored instance (mean / median / p90):
 
 | Metric | Mean | Median | p90 |
 |---|---|---|---|
-| Agent turns | {{TURNS_MEAN}} | {{TURNS_MED}} | {{TURNS_P90}} |
-| Prompt tokens (sum over calls) | {{PT_MEAN}} | {{PT_MED}} | {{PT_P90}} |
-| Completion tokens | {{CT_MEAN}} | {{CT_MED}} | {{CT_P90}} |
-| Completion tokens per call | {{CPT_MEAN}} | {{CPT_MED}} | {{CPT_P90}} |
-| Peak context (prompt tokens) | {{PEAK_MEAN}} | {{PEAK_MED}} | {{PEAK_P90}} |
-| Agent wall time | {{AGENT_S_MEAN}} | {{AGENT_S_MED}} | {{AGENT_S_P90}} |
-| Eval wall time | {{EVAL_S_MEAN}} | {{EVAL_S_MED}} | {{EVAL_S_P90}} |
+| Agent turns | 58.4 | 51 | 109 |
+| Prompt tokens (sum over calls) | 2.58M | 1.38M | 7.01M |
+| Completion tokens | 31.7K | 24.8K | 71.3K |
+| Completion tokens per call | 487 | 442 | 824 |
+| Peak context (prompt tokens) | 57.4K | 47.5K | 121.8K |
+| Agent wall time | 12.2 min | 8.6 min | 28.0 min |
+| Eval wall time | 50 s | 32 s | 110 s |
 
-- Largest peak context in the run: {{PEAK_MAX}} of 262144.
-- Total run wall time: {{RUN_WALL_TIME}} (start 2026-10-31 10:53 EDT, end
-  {{RUN_END}}).
-- Total tokens: {{TOTAL_PROMPT_TOKENS}} prompt, {{TOTAL_COMPLETION_TOKENS}}
+- Largest peak context in the run: 196,438 of 262144.
+- Total run wall time: 63.1 h (start 2026-10-31 10:53 EDT, end
+  2026-11-03 01:02 EST).
+- Total tokens: 1.29B prompt, 15.8M
   completion.
 
 Pilot (cloud sandbox, 10 instances): about 100 tok/s per stream decode with
@@ -228,6 +229,7 @@ are in the infra-excluded list.
 Fix commits on `claude/flint-swebench`:
 
 ```
+23e15aa flint_swebench: add wire_probe helper used by the adapter test
 3eb821e flint_swebench: serialize image cleanup with pulls
 c1bd2a1 flint_swebench: don't treat transient layer errors as missing images
 b20d887 flint_swebench: tolerate high-UID files in rootless podman pulls
