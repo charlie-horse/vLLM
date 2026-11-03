@@ -256,7 +256,11 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    services.vllm-sm70.models = lib.mapAttrs (_: lib.mkDefault) builtinModels;
+    # mkDefault per field, so a host can override one field of a built-in
+    # model (e.g. models.flint.maxNumSeqs) without replacing the whole entry.
+    services.vllm-sm70.models = lib.mapAttrs (
+      _: lib.mapAttrs (_: lib.mkDefault)
+    ) builtinModels;
 
     # The model's `lmcache` field is the switch; set it there, not here.
     services.lmcache-sm70 = {

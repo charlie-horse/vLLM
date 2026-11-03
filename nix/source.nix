@@ -1,6 +1,6 @@
 # The fork's source tree for the sm_70 build: the whole repo minus the Nix
-# packaging, so a change under nix/ (or to flake.nix/flake.lock) doesn't
-# rebuild the ~25 min CUDA tree. Content-addressed like a fetchFromGitHub
+# packaging and .claude/, so a change under nix/ (or to flake.nix/flake.lock,
+# or agent settings) doesn't rebuild the ~25 min CUDA tree. Content-addressed like a fetchFromGitHub
 # "source", so the same commit gives the same store path either way.
 { lib }:
 let
@@ -10,6 +10,8 @@ let
       ../nix
       ../flake.nix
       ../flake.lock
+      # Agent/editor settings, not part of the build.
+      ../.claude
     ]
   );
 in
