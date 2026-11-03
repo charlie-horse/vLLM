@@ -432,6 +432,7 @@ COMPATIBILITY_CONSUMERS = {
         "dual_cta",
         "padded_smem",
         "sink_fused_decode",
+        "sink_fused_zero_counters",
     },
     "vllm/config/diagnostic_sampling.py": {"legacy_rejection_profile"},
     "vllm/config/sm70_dflash2.py": {"dflash2_bf16_emulation"},

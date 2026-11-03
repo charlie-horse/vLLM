@@ -27,7 +27,11 @@ _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 _prefill_splitkv3_workspace_cache = {}
 _grouped_verify_workspace_cache = {}
+_fused_decode_counter_cache = {}
 logger = logging.getLogger(__name__)
+# Arrival counters of the one-launch grouped sink decode: int32, one per
+# (row, KV head), 1024 rows x 16 KV heads (64 KiB) per device and stream.
+FUSED_DECODE_COUNTER_CAPACITY = 1024 * 16
 
 
 @dataclass(frozen=True)
@@ -47,9 +51,20 @@ class _DecodeWorkspace:
     max_num_partitions: int
     captured: bool = False
     previous: "_DecodeWorkspace | None" = None
-    # int32 arrival counters of the single-launch sink decode, one per
-    # (row, head); zero between launches. Allocated on first use.
-    fused_counters: torch.Tensor | None = None
+
+
+@dataclass
+class _FusedDecodeCounters:
+    """Zero-between-launches arrival counters of the one-launch sink decode.
+
+    Allocated (and zeroed) only outside CUDA-graph capture: a ``torch.zeros``
+    under capture only records a memset into that graph, so graphs captured
+    later would replay on whatever the buffer holds. ``retired`` keeps
+    smaller buffers alive that captured graphs may still reference.
+    """
+
+    buffer: torch.Tensor
+    retired: list[torch.Tensor]
 
 
 @dataclass
@@ -125,6 +140,95 @@ def _sink_fused_decode_enabled(*, _runtime=None) -> bool:
     if _runtime is not None:
         return bool(getattr(_runtime.policy, "sink_fused_decode", True))
     return _legacy.sink_fused_decode()
+
+
+def _sink_fused_zero_counters_enabled(*, _runtime=None) -> bool:
+    if _runtime is not None:
+        return bool(getattr(_runtime.policy, "sink_fused_zero_counters", False))
+    return _legacy.sink_fused_zero_counters()
+
+
+_fused_decode_warned: set[str] = set()
+
+
+def _warn_fused_decode_once(reason: str) -> None:
+    if reason in _fused_decode_warned:
+        return
+    _fused_decode_warned.add(reason)
+    logger.warning(
+        "Flash-V100 one-launch sink decode is off for this CUDA graph (%s); "
+        "it decodes with the partition kernel plus reducer.",
+        reason,
+    )
+
+
+def _fused_decode_counter_cache_for(_runtime=None) -> dict:
+    if _runtime is None:
+        return _fused_decode_counter_cache
+    cache = getattr(_runtime, "fused_decode_counter_cache", None)
+    if cache is None:
+        cache = {}
+        _runtime.fused_decode_counter_cache = cache
+    return cache
+
+
+def _fused_decode_counters(
+    device: torch.device, required: int, *, _runtime=None
+) -> torch.Tensor | None:
+    """The stream's counters, allocated eagerly; None where they cannot be.
+
+    Never creates zero-dependent state under capture: a capture without a
+    big-enough buffer from an earlier eager call gets None and takes the
+    two-launch path.
+    """
+    cache = _fused_decode_counter_cache_for(_runtime)
+    device_index = device.index if device.index is not None else -1
+    key = (device_index, _workspace_stream_id(device))
+    entry = cache.get(key)
+    if entry is not None and entry.buffer.numel() >= required:
+        return entry.buffer
+    if _cuda_graph_capture_active():
+        _warn_fused_decode_once(
+            "no counters were allocated before capture"
+            if entry is None
+            else f"capture needs {required} counters, {entry.buffer.numel()} "
+            "were allocated"
+        )
+        return None
+    if torch.compiler.is_compiling():
+        return None
+    buffer = torch.zeros(
+        max(FUSED_DECODE_COUNTER_CAPACITY, required),
+        dtype=torch.int32,
+        device=device,
+    )
+    retired = [] if entry is None else [*entry.retired, entry.buffer]
+    cache[key] = _FusedDecodeCounters(buffer, retired)
+    return buffer
+
+
+def _fused_decode_available(*, _runtime=None) -> bool:
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    return hasattr(native, "decode_paged_sinks_fused_fwd") and (
+        _sink_fused_decode_enabled(_runtime=_runtime)
+    )
+
+
+def flash_attn_decode_paged_sinks_prepare(
+    device: torch.device | str | int, *, _runtime=None
+) -> bool:
+    """Allocate the one-launch sink decode's counters before graph capture.
+
+    Call it eagerly (for example from the profile run) on the stream that
+    later captures. A no-op, returning False, when the fused decode is
+    switched off or unavailable, or under capture.
+    """
+    if not _fused_decode_available(_runtime=_runtime):
+        return False
+    device = torch.device(device)
+    if device.type != "cuda" or _cuda_graph_capture_active():
+        return False
+    return _fused_decode_counters(device, 0, _runtime=_runtime) is not None
 
 
 def _xqa_staged_pv_enabled(*, _runtime=None) -> bool:
@@ -361,7 +465,6 @@ def _get_decode_workspace_for_plan(
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
     partial_dtype: torch.dtype = torch.float16,
-    fused_counters: bool = False,
     _runtime=None,
 ):
     device_index = q.device.index if q.device.index is not None else -1
@@ -434,23 +537,12 @@ def _get_decode_workspace_for_plan(
     if active_num_partitions is None:
         workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
-    buffers = (
+    return (
         workspace.tmp_out[:batch_capacity],
         workspace.max_logits[:batch_capacity],
         workspace.exp_sums[:batch_capacity],
         active_num_partitions,
     )
-    if not fused_counters:
-        return buffers
-    if workspace.fused_counters is None:
-        # Zeroed once; each fused launch leaves its counters at zero. Rows
-        # times query heads covers every (row, KV head) of any GQA ratio.
-        workspace.fused_counters = torch.zeros(
-            workspace.tmp_out.size(0) * workspace.tmp_out.size(1),
-            dtype=torch.int32,
-            device=q.device,
-        )
-    return (*buffers, workspace.fused_counters)
 
 
 def _get_xqa_staged_rescale_workspace(
@@ -1238,21 +1330,27 @@ def flash_attn_decode_paged(
         and q.shape[1] == 8 * k_cache.shape[2]
         and anchor_lens is None
         and not e4m3_fp32
-        and hasattr(native, "decode_paged_sinks_fused_fwd")
-        and _sink_fused_decode_enabled(_runtime=_runtime)
+        and _fused_decode_available(_runtime=_runtime)
     )
-    workspace = _get_decode_workspace_for_plan(
-        q,
-        batch_capacity=batch_capacity,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        plan=plan,
-        active_num_partitions=active_num_partitions,
-        partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
-        fused_counters=fused,
-        _runtime=_runtime,
+    counters = (
+        _fused_decode_counters(
+            q.device, batch_capacity * k_cache.shape[2], _runtime=_runtime
+        )
+        if fused
+        else None
     )
-    tmp_out, max_logits, exp_sums, active_num_partitions = workspace[:4]
+    tmp_out, max_logits, exp_sums, active_num_partitions = (
+        _get_decode_workspace_for_plan(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            plan=plan,
+            active_num_partitions=active_num_partitions,
+            partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
+            _runtime=_runtime,
+        )
+    )
 
     native_args = (
         q,
@@ -1278,8 +1376,11 @@ def flash_attn_decode_paged(
     )
     if sinks is None:
         return native.decode_paged_fwd(*native_args)
-    if fused:
-        return native.decode_paged_sinks_fused_fwd(*native_args, sinks, workspace[4])
+    if counters is not None:
+        if _sink_fused_zero_counters_enabled(_runtime=_runtime):
+            # Optional belt and braces: one memset per call (captured too).
+            counters[: batch_capacity * k_cache.shape[2]].zero_()
+        return native.decode_paged_sinks_fused_fwd(*native_args, sinks, counters)
     return native.decode_paged_sinks_fwd(*native_args, sinks)
 
 
@@ -2295,6 +2396,7 @@ __all__ = [
     "flash_attn_qk_scores",
     "flash_attn_decode_paged",
     "flash_attn_decode_paged_sinks_available",
+    "flash_attn_decode_paged_sinks_prepare",
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",

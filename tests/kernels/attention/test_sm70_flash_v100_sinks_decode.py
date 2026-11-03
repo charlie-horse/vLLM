@@ -491,7 +491,7 @@ def test_decode_sinks_fused_cuda_graph_server_envelope(sm70_fused, window):
         run()
     torch.cuda.current_stream(device).wait_stream(side)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=side):
         run()
 
     for step, new_lens in enumerate(
@@ -508,6 +508,153 @@ def test_decode_sinks_fused_cuda_graph_server_envelope(sm70_fused, window):
         assert torch.equal(out, first)
         expected = _reference(q, k_cache, v_cache, block_table, lens, window, sinks)
         torch.testing.assert_close(out.float(), expected, rtol=RTOL, atol=ATOL)
+
+
+CAPTURE_BATCHES = (8, 4, 2, 1)
+CAPTURE_CAPACITY = 8192
+
+
+@pytest.fixture
+def fresh_decode_caches(sm70_fused, monkeypatch):
+    """No decode plan, workspace or counters survive from earlier tests."""
+    _, interface = sm70_fused
+    for name in (
+        "_decode_plan_cache",
+        "_decode_workspace_cache",
+        "_fused_decode_counter_cache",
+    ):
+        monkeypatch.setattr(interface, name, {})
+    monkeypatch.setattr(interface, "_fused_decode_warned", set())
+    monkeypatch.setenv(FUSED_ENV, "1")
+    return sm70_fused
+
+
+def _descending_capture(interface, device, window, stream, *, eager_first):
+    """Capture graphs for batches 8, 4, 2, 1 on one stream, largest first.
+
+    The rows are prefixes of shared persistent buffers, as the runner's are,
+    and the decode workspace grows during the first (largest) capture.
+    """
+    rows = CAPTURE_BATCHES[0]
+    k_cache, v_cache, block_table = _paged_kv(
+        [CAPTURE_CAPACITY] * rows, 2, 16, device, seed=111
+    )
+    q = _query(rows, 16, device, seed=112)
+    lens = torch.ones(rows, dtype=torch.int32, device=device)
+    active = torch.ones(1, dtype=torch.int32, device=device)
+    sinks = _sinks(16, device, seed=113)
+    out = torch.zeros_like(q)
+    fused_calls = []
+    counters_of = interface._fused_decode_counters
+
+    def recording_counters(*args, **kwargs):
+        counters = counters_of(*args, **kwargs)
+        fused_calls.append(counters is not None)
+        return counters
+
+    def run(batch):
+        _decode(
+            interface,
+            q[:batch],
+            k_cache,
+            v_cache,
+            block_table[:batch],
+            lens[:batch],
+            window,
+            out=out[:batch],
+            max_seq_len_hint=1,
+            workspace_seq_capacity_hint=CAPTURE_CAPACITY,
+            active_num_partitions=active,
+            partition_size_hint=256,
+            sinks=sinks,
+        )
+
+    stream.wait_stream(torch.cuda.current_stream(device))
+    graphs = {}
+    with torch.cuda.stream(stream):
+        if eager_first:
+            assert interface.flash_attn_decode_paged_sinks_prepare(device)
+        interface._fused_decode_counters = recording_counters
+        try:
+            for batch in CAPTURE_BATCHES:
+                graphs[batch] = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graphs[batch], stream=stream):
+                    run(batch)
+        finally:
+            interface._fused_decode_counters = counters_of
+    torch.cuda.current_stream(device).wait_stream(stream)
+    torch.accelerator.synchronize()
+    state = (q, k_cache, v_cache, block_table, lens, active, sinks, out)
+    return graphs, state, fused_calls
+
+
+def _two_launch(interface, monkeypatch, state, window, batch):
+    q, k_cache, v_cache, block_table, lens, _, sinks, _ = state
+    monkeypatch.setenv(FUSED_ENV, "0")
+    try:
+        return _decode(
+            interface,
+            q[:batch],
+            k_cache,
+            v_cache,
+            block_table[:batch],
+            lens[:batch],
+            window,
+            max_seq_len_hint=int(lens[:batch].max()),
+            sinks=sinks,
+        )
+    finally:
+        monkeypatch.setenv(FUSED_ENV, "1")
+
+
+@WINDOWS
+@pytest.mark.parametrize("eager_first", [False, True], ids=["capture-only", "eager"])
+@torch.inference_mode()
+def test_decode_sinks_fused_descending_capture(
+    fresh_decode_caches, monkeypatch, window, eager_first
+):
+    """Graphs captured largest first, as the runner does, replay correctly.
+
+    Without an eager call first, no counters may be created under capture
+    (a torch.zeros there only records a memset into the first graph): every
+    graph takes the two-launch path. With the eager preallocation first,
+    every graph takes the fused path. Either way the smallest graph decodes
+    65, 300 and 5000 tokens as the two-launch kernels do, and the counters
+    are back at zero after each replay.
+    """
+    device, interface = fresh_decode_caches
+    stream = torch.cuda.Stream(device)
+    graphs, state, fused_calls = _descending_capture(
+        interface, device, window, stream, eager_first=eager_first
+    )
+    q, k_cache, v_cache, block_table, lens, active, sinks, out = state
+    assert fused_calls == [eager_first] * len(CAPTURE_BATCHES)
+    cache = interface._fused_decode_counter_cache
+    assert bool(cache) == eager_first
+    for step, length in enumerate((65, 300, 5000)):
+        q.copy_(_query(q.shape[0], 16, device, seed=120 + step))
+        lens.fill_(0)
+        lens[0] = length
+        active.fill_(max(1, math.ceil(length / 256)))
+        graphs[1].replay()
+        torch.accelerator.synchronize()
+        two = _two_launch(interface, monkeypatch, state, window, 1)
+        torch.testing.assert_close(out[:1], two, rtol=GROUPED_RTOL, atol=GROUPED_ATOL)
+        expected = _reference(
+            q[:1], k_cache, v_cache, block_table[:1], lens[:1], window, sinks
+        )
+        torch.testing.assert_close(out[:1].float(), expected, rtol=RTOL, atol=ATOL)
+        for entry in cache.values():
+            assert torch.count_nonzero(entry.buffer) == 0
+    # The largest graph, captured while the workspace grew, still decodes.
+    lens.copy_(torch.tensor([65, 300, 5000, 1, 64, 513, 4096, 8192]))
+    active.fill_(CAPTURE_CAPACITY // 256)
+    graphs[8].replay()
+    torch.accelerator.synchronize()
+    two = _two_launch(interface, monkeypatch, state, window, 8)
+    torch.testing.assert_close(out, two, rtol=GROUPED_RTOL, atol=GROUPED_ATOL)
+    for entry in cache.values():
+        assert torch.count_nonzero(entry.buffer) == 0
 
 
 @torch.inference_mode()
@@ -637,6 +784,125 @@ def test_interface_grouped_sinks_take_the_fused_entry_point(cpu_interface):
     assert first[6].data_ptr() == second[6].data_ptr()
 
 
+def _capturing(monkeypatch, interface, active: bool) -> None:
+    monkeypatch.setattr(interface, "_cuda_graph_capture_active", lambda: active)
+
+
+def test_fused_counters_are_never_created_under_capture(
+    cpu_interface, monkeypatch, caplog
+):
+    interface, native = cpu_interface(with_fused=True)
+    q, k, v, table, lens = _cpu_inputs()
+    sinks = torch.zeros(16, dtype=torch.float32)
+    _capturing(monkeypatch, interface, True)
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    assert [name for name, _ in native.calls] == ["decode_paged_sinks_fwd"] * 2
+    assert all(len(args) == 21 for _, args in native.calls)
+    assert interface._fused_decode_counter_cache == {}
+    warnings = [r for r in caplog.records if "one-launch sink decode" in r.message]
+    assert len(warnings) == 1
+    assert "no counters were allocated before capture" in warnings[0].message
+
+
+def test_fused_counters_allocated_eagerly_serve_later_captures(
+    cpu_interface, monkeypatch
+):
+    interface, native = cpu_interface(with_fused=True)
+    q, k, v, table, lens = _cpu_inputs()
+    sinks = torch.zeros(16, dtype=torch.float32)
+    _capturing(monkeypatch, interface, False)
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    ((key, entry),) = interface._fused_decode_counter_cache.items()
+    assert entry.buffer.numel() == interface.FUSED_DECODE_COUNTER_CAPACITY
+    assert entry.buffer.dtype == torch.int32
+    assert torch.count_nonzero(entry.buffer) == 0
+    _capturing(monkeypatch, interface, True)
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    names = [name for name, _ in native.calls]
+    assert names == ["decode_paged_sinks_fused_fwd"] * 2
+    assert all(args[21] is entry.buffer for _, args in native.calls)
+
+
+def test_fused_counters_capacity_refusal_and_eager_growth(cpu_interface, monkeypatch):
+    interface, _ = cpu_interface(with_fused=True)
+    device = torch.device("cpu")
+    capacity = interface.FUSED_DECODE_COUNTER_CAPACITY
+    _capturing(monkeypatch, interface, False)
+    first = interface._fused_decode_counters(device, 8)
+    assert first is not None and first.numel() == capacity
+    _capturing(monkeypatch, interface, True)
+    assert interface._fused_decode_counters(device, capacity) is first
+    assert interface._fused_decode_counters(device, capacity + 1) is None
+    assert interface._fused_decode_counter_cache[(-1, -1)].buffer is first
+    _capturing(monkeypatch, interface, False)
+    grown = interface._fused_decode_counters(device, capacity + 1)
+    assert grown is not None and grown.numel() == capacity + 1
+    entry = interface._fused_decode_counter_cache[(-1, -1)]
+    # Graphs captured with the old buffer keep it alive.
+    assert entry.buffer is grown and entry.retired == [first]
+
+
+def test_fused_counters_prepare_hook(cpu_interface, monkeypatch):
+    interface, _ = cpu_interface(with_fused=True)
+    allocated: list[tuple[torch.device, int]] = []
+
+    def fake_counters(device, required, **kw):
+        allocated.append((device, required))
+        return torch.zeros(1, dtype=torch.int32)
+
+    monkeypatch.setattr(interface, "_fused_decode_counters", fake_counters)
+    _capturing(monkeypatch, interface, False)
+    assert not interface.flash_attn_decode_paged_sinks_prepare("cpu")
+    assert interface.flash_attn_decode_paged_sinks_prepare("cuda:1")
+    assert allocated == [(torch.device("cuda:1"), 0)]
+    _capturing(monkeypatch, interface, True)
+    assert not interface.flash_attn_decode_paged_sinks_prepare("cuda:1")
+    monkeypatch.setenv(FUSED_ENV, "0")
+    _capturing(monkeypatch, interface, False)
+    assert not interface.flash_attn_decode_paged_sinks_prepare("cuda:1")
+    assert allocated == [(torch.device("cuda:1"), 0)]
+
+
+def test_fused_counters_optional_per_launch_zero(cpu_interface, monkeypatch):
+    interface, native = cpu_interface(with_fused=True)
+    q, k, v, table, lens = _cpu_inputs()
+    sinks = torch.zeros(16, dtype=torch.float32)
+    rows = q.shape[0] * k.shape[2]
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    counters = native.calls[0][1][21]
+    counters.fill_(7)
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    assert torch.all(counters == 7)
+    monkeypatch.setenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS", "1")
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    assert torch.count_nonzero(counters[:rows]) == 0
+    assert torch.all(counters[rows:] == 7)
+
+
+def test_impl_prepares_fused_counters_once_outside_capture(monkeypatch):
+    from vllm.v1.attention.backends.flash_v100 import impl as _impl
+
+    calls: list[torch.device] = []
+    layer = _impl.FlashAttnV100Impl.__new__(_impl.FlashAttnV100Impl)
+    layer.flash_attn_decode_paged_sinks_prepare = calls.append
+    query = torch.zeros((1, 16, HEAD_DIM), dtype=torch.float16)
+    capturing = [True]
+    monkeypatch.setattr(
+        _impl._routing, "is_cuda_graph_capturing", lambda tensor: capturing[0]
+    )
+    layer._prepare_fused_sink_decode(query)
+    assert calls == []  # no sinks admitted
+    layer._flash_v100_sinks = torch.zeros(16, dtype=torch.float32)
+    layer._prepare_fused_sink_decode(query)
+    assert calls == []  # under capture
+    capturing[0] = False
+    layer._prepare_fused_sink_decode(query)
+    layer._prepare_fused_sink_decode(query)
+    assert calls == [query.device]
+
+
 def test_interface_fused_decode_kill_switch(cpu_interface, monkeypatch):
     monkeypatch.setenv(FUSED_ENV, "0")
     interface, native = cpu_interface(with_fused=True)
@@ -645,6 +911,9 @@ def test_interface_fused_decode_kill_switch(cpu_interface, monkeypatch):
     interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
     ((name, args),) = native.calls
     assert name == "decode_paged_sinks_fwd" and len(args) == 21
+    assert interface._fused_decode_counter_cache == {}
+    assert not interface.flash_attn_decode_paged_sinks_prepare("cuda:0")
+    assert interface._fused_decode_counter_cache == {}
 
 
 @pytest.mark.parametrize(

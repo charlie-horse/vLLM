@@ -50,6 +50,8 @@ _fp8_e5m2_paged_kv_to_fp16_checked = False
 _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
 _paged_kv_utils = None
+_flash_attn_decode_paged_sinks_prepare = None
+_flash_attn_decode_paged_sinks_prepare_checked = False
 
 
 def callable_accepts_keyword(fn: object, name: str) -> bool:
@@ -157,6 +159,20 @@ def get_flash_ops():
             _flash_attn_prefill_paged_splitkv,
         )
     )
+
+
+def get_flash_decode_sinks_prepare_op():
+    """Eager allocator of the one-launch sink decode's counters, if built."""
+    global _flash_attn_decode_paged_sinks_prepare
+    global _flash_attn_decode_paged_sinks_prepare_checked
+    if not _flash_attn_decode_paged_sinks_prepare_checked:
+        _flash_attn_decode_paged_sinks_prepare_checked = True
+        try:
+            from flash_attn_v100 import flash_attn_decode_paged_sinks_prepare
+        except ImportError:
+            flash_attn_decode_paged_sinks_prepare = None
+        _flash_attn_decode_paged_sinks_prepare = flash_attn_decode_paged_sinks_prepare
+    return bind_attention_operation(_flash_attn_decode_paged_sinks_prepare)
 
 
 def get_flash_grouped_verify_op():

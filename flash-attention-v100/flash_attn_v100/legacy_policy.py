@@ -43,5 +43,9 @@ def sink_fused_decode():
     return os.getenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "1") != "0"
 
 
+def sink_fused_zero_counters():
+    return os.getenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS", "0") == "1"
+
+
 def batch_xqa():
     return os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"

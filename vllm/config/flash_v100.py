@@ -588,6 +588,7 @@ class FlashV100Options(CapturedFlashOptions):
             "padded_smem": raw_or("XQA_PADDED_SMEM", "1") != "0",
             "dual_cta": raw_or("XQA_G6_DUAL_CTA", "0") == "1",
             "sink_fused_decode": self.sink_fused_decode,
+            "sink_fused_zero_counters": self.sink_fused_zero_counters,
         }
 
     def hash_values(self):
@@ -605,7 +606,11 @@ class FlashV100Options(CapturedFlashOptions):
                 or self.prefill_d256_gqa_v37
             ):
                 continue
-            if field in ("share_decode_workspace", "sink_fused_decode"):
+            if field in (
+                "share_decode_workspace",
+                "sink_fused_decode",
+                "sink_fused_zero_counters",
+            ):
                 continue
             if field.startswith("bfla_") and not self.bfla_prefill:
                 continue
@@ -633,7 +638,8 @@ class FlashV100Options(CapturedFlashOptions):
             for field, value in self.python_policy.items()
             # Launch-shape choices inside the opaque decode op, like the
             # shared workspace, do not change compiled graphs.
-            if field not in ("share_workspace", "sink_fused_decode")
+            if field
+            not in ("share_workspace", "sink_fused_decode", "sink_fused_zero_counters")
             and (
                 field not in ("scalar_fast", "batch_xqa")
                 or self.cache_dtype in ("fp8", "fp8_e4m3")
@@ -862,6 +868,9 @@ class FlashV100Options(CapturedFlashOptions):
     sink_fused_decode: bool | None = None
     """Retained VLLM_SM70_FLINT_ATTN_FUSED_DECODE input: grouped sink decode in
     one launch per layer."""
+    sink_fused_zero_counters: bool | None = None
+    """Retained VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS input: memset the
+    fused decode's arrival counters before every launch."""
     xqa_staged_pv: bool | None = None
     """Retained VLLM_FLASH_V100_XQA_STAGED_PV input."""
 
@@ -1302,6 +1311,11 @@ class FlashV100Options(CapturedFlashOptions):
             "1",
         ),
         "sink_fused_decode": ("VLLM_SM70_FLINT_ATTN_FUSED_DECODE", "ne0", "1"),
+        "sink_fused_zero_counters": (
+            "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS",
+            "eq1",
+            "0",
+        ),
         "xqa_staged_pv": ("VLLM_FLASH_V100_XQA_STAGED_PV", "eq1", "0"),
     }
 

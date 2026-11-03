@@ -687,6 +687,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS: int = 8192
     VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE: bool = True
     VLLM_SM70_FLINT_ATTN_FUSED_DECODE: bool = True
+    VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS: bool = False
     VLLM_DFLASH_COMPACT_AUX_HIDDEN: bool = True
     VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
@@ -10522,6 +10523,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("FlashAttentionV100Backend",),
+        user_visible=False,
+    ),
+    # Zero the one-launch sink decode's arrival counters before every launch.
+    "VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS": env_var(
+        lambda: (
+            os.getenv("VLLM_SM70_FLINT_ATTN_FUSED_DECODE_ZERO_COUNTERS", "0") == "1"
+        ),
+        description=(
+            "Zero the one-launch sink decode's arrival counters with a memset "
+            "before every launch (one per sink layer and step, captured into "
+            "CUDA graphs). Diagnostic belt and braces: the kernel already "
+            "leaves them at zero and they are allocated zeroed before capture."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
         user_visible=False,

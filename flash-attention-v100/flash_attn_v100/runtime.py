@@ -27,6 +27,9 @@ class PythonPolicy:
     # Grouped GQA-8 D128 sink decode in one launch per layer (partitions and
     # reduction); False keeps the partition kernel plus the reducer.
     sink_fused_decode: bool = True
+    # Zero the fused decode's arrival counters before every launch (one
+    # memset per layer call); off by default, the kernel resets them itself.
+    sink_fused_zero_counters: bool = False
 
     def partition(self) -> int | None:
         if self.partition_error is not None:
@@ -67,6 +70,7 @@ class AttentionRuntime:
         self.turboquant_decode_workspace_cache = {}
         self.prefill_splitkv3_workspace_cache = {}
         self.grouped_verify_workspace_cache = {}
+        self.fused_decode_counter_cache = {}
         self.bindings = {}
 
     def bind(self, operation):
@@ -90,6 +94,7 @@ class AttentionRuntime:
         self.turboquant_decode_workspace_cache.clear()
         self.prefill_splitkv3_workspace_cache.clear()
         self.grouped_verify_workspace_cache.clear()
+        self.fused_decode_counter_cache.clear()
         self.bindings.clear()
         self.native.__dict__.clear()
         self.native_policy = None
