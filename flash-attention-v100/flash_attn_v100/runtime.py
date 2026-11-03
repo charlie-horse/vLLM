@@ -71,6 +71,7 @@ class AttentionRuntime:
         self.prefill_splitkv3_workspace_cache = {}
         self.grouped_verify_workspace_cache = {}
         self.fused_decode_counter_cache = {}
+        self.fused_decode_capture_counts = {"fused": 0, "two_launch": 0}
         self.bindings = {}
 
     def bind(self, operation):

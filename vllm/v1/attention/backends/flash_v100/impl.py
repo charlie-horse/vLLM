@@ -43,6 +43,28 @@ from vllm.v1.attention.ops.sm70_grouped import (
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
+# (prepare op, device index) already given the one-launch sink decode's
+# counters; shared by every layer.
+_FUSED_DECODE_PREPARED: set[tuple[int, int]] = set()
+# Set while sink layers are being captured; the next eager forward logs how
+# the captured graphs decode the grouped sink layers.
+_SINK_CAPTURE_PENDING = [False]
+
+
+def _log_sink_capture_summary(counts) -> None:
+    if counts is None:
+        return
+    fused, two_launch = counts()
+    if not fused and not two_launch:
+        return
+    log = logger.warning if two_launch else logger.info
+    log(
+        "Flash-V100 grouped sink decode in captured CUDA graphs so far: %d "
+        "one-launch, %d two-launch (partition kernel plus reducer).",
+        fused,
+        two_launch,
+    )
+
 
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
@@ -53,9 +75,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     # admitted.
     _flash_v100_sinks: torch.Tensor | None = None
     _flash_v100_sink_rejection: str | None = None
-    # Set once the one-launch sink decode's counters were requested eagerly.
-    _flash_v100_fused_decode_prepared = False
     flash_attn_decode_paged_sinks_prepare = None
+    flash_attn_decode_paged_sinks_capture_counts = None
 
     allow_triton_fallback = _config.ConfigField[bool]("allow_triton_fallback")
     compare_bhmd_out_dir = _config.ConfigField[str | None]("compare_bhmd_out_dir")
@@ -193,10 +214,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged_splitkv,
         ) = _ops.get_flash_ops()
         self.flash_attn_grouped_verify_paged = _ops.get_flash_grouped_verify_op()
-        self.flash_attn_decode_paged_sinks_prepare = (
-            _ops.get_flash_decode_sinks_prepare_op()
+        (
+            self.flash_attn_decode_paged_sinks_prepare,
+            self.flash_attn_decode_paged_sinks_capture_counts,
+        ) = (
+            _ops.get_flash_decode_sinks_prepare_ops()
             if self.flash_attn_decode_paged is not None
-            else None
+            else (None, None)
         )
         use_e4m3_fp32 = (
             _config.options().value("e4m3_grouped_fp32")
@@ -863,19 +887,33 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
 
     def _prepare_fused_sink_decode(self, query: torch.Tensor) -> None:
-        """Allocate the one-launch sink decode's counters on an eager call.
+        """Allocate the one-launch sink decode's counters on an eager forward.
 
-        The profile run reaches here with no metadata, on the stream that later
-        captures, so the counters exist (zeroed) before any CUDA graph. Under
-        capture nothing is allocated; a graph without counters decodes with
-        two launches. A no-op when VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0.
+        The counters are per device, so graphs captured on any stream find
+        them once they exist. The first eager sink-layer forward (the profile
+        run, which precedes every capture with or without capture warmups)
+        allocates them, zeroed. Under capture nothing is allocated: a graph
+        without counters decodes with two launches. The first eager forward
+        after a capture logs how the captured graphs decode. prepare is a
+        no-op when VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0.
         """
-        if self._flash_v100_fused_decode_prepared or self._flash_v100_sinks is None:
-            return
         prepare = self.flash_attn_decode_paged_sinks_prepare
-        if prepare is None or _routing.is_cuda_graph_capturing(query):
+        if (
+            prepare is None
+            or self._flash_v100_sinks is None
+            or query.device.type != "cuda"
+        ):
             return
-        self._flash_v100_fused_decode_prepared = True
+        if _routing.is_cuda_graph_capturing(query):
+            _SINK_CAPTURE_PENDING[0] = True
+            return
+        if _SINK_CAPTURE_PENDING[0]:
+            _SINK_CAPTURE_PENDING[0] = False
+            _log_sink_capture_summary(self.flash_attn_decode_paged_sinks_capture_counts)
+        key = (id(prepare), query.device.index or 0)
+        if key in _FUSED_DECODE_PREPARED:
+            return
+        _FUSED_DECODE_PREPARED.add(key)
         prepare(query.device)
 
     def forward(

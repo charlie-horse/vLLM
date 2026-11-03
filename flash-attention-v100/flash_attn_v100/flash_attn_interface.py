@@ -30,8 +30,10 @@ _grouped_verify_workspace_cache = {}
 _fused_decode_counter_cache = {}
 logger = logging.getLogger(__name__)
 # Arrival counters of the one-launch grouped sink decode: int32, one per
-# (row, KV head), 1024 rows x 16 KV heads (64 KiB) per device and stream.
+# (row, KV head), 1024 rows x 16 KV heads (64 KiB) per device.
 FUSED_DECODE_COUNTER_CAPACITY = 1024 * 16
+# Grouped sink decodes recorded into CUDA graphs: one-launch vs two-launch.
+_fused_decode_capture_counts = {"fused": 0, "two_launch": 0}
 
 
 @dataclass(frozen=True)
@@ -149,17 +151,38 @@ def _sink_fused_zero_counters_enabled(*, _runtime=None) -> bool:
 
 
 _fused_decode_warned: set[str] = set()
+_FUSED_DECODE_OFF = (
+    "Flash-V100 one-launch sink decode is off for CUDA graphs captured on "
+    "this device ({}); they decode with the partition kernel plus reducer. "
+    "To keep it, run an eager sink-layer forward or call "
+    "flash_attn_decode_paged_sinks_prepare on the device before capture; "
+    "VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0 selects the two-launch route on "
+    "purpose."
+)
+# Logging formats per fixed reason code; numbers stay lazy %-arguments.
+_FUSED_DECODE_OFF_FORMATS = {
+    "no_counters": _FUSED_DECODE_OFF.format(
+        "no counters were allocated before capture"
+    ),
+    "capacity": _FUSED_DECODE_OFF.format(
+        "capture needs %s counters, %s were allocated"
+    ),
+}
 
 
-def _warn_fused_decode_once(reason: str) -> None:
-    if reason in _fused_decode_warned:
+def _warn_fused_decode_once(code: str, *args) -> None:
+    """Warn once per fixed reason code, with its numbers as lazy args."""
+    if code in _fused_decode_warned:
         return
-    _fused_decode_warned.add(reason)
-    logger.warning(
-        "Flash-V100 one-launch sink decode is off for this CUDA graph (%s); "
-        "it decodes with the partition kernel plus reducer.",
-        reason,
-    )
+    _fused_decode_warned.add(code)
+    logger.warning(_FUSED_DECODE_OFF_FORMATS[code], *args)
+
+
+def _normalized_device(device: torch.device) -> torch.device:
+    """``cuda`` without an index is the current device, as kernels see it."""
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.accelerator.current_device_index())
+    return device
 
 
 def _fused_decode_counter_cache_for(_runtime=None) -> dict:
@@ -175,25 +198,28 @@ def _fused_decode_counter_cache_for(_runtime=None) -> dict:
 def _fused_decode_counters(
     device: torch.device, required: int, *, _runtime=None
 ) -> torch.Tensor | None:
-    """The stream's counters, allocated eagerly; None where they cannot be.
+    """The device's counters; None where they cannot be created.
 
+    Keyed by device, not stream: a capture finds them whichever stream ran
+    the eager call that created them (vLLM captures on a fresh stream, with
+    or without an eager warmup there). That is safe because each launch
+    leaves them at zero and sink decodes on one device never run
+    concurrently: attention runs on one compute stream at a time (DBO
+    micro-batches share one compute stream; captures run one after another).
     Never creates zero-dependent state under capture: a capture without a
-    big-enough buffer from an earlier eager call gets None and takes the
-    two-launch path.
+    big-enough buffer gets None and takes the two-launch path.
     """
     cache = _fused_decode_counter_cache_for(_runtime)
-    device_index = device.index if device.index is not None else -1
-    key = (device_index, _workspace_stream_id(device))
+    device = _normalized_device(device)
+    key = device.index if device.index is not None else -1
     entry = cache.get(key)
     if entry is not None and entry.buffer.numel() >= required:
         return entry.buffer
     if _cuda_graph_capture_active():
-        _warn_fused_decode_once(
-            "no counters were allocated before capture"
-            if entry is None
-            else f"capture needs {required} counters, {entry.buffer.numel()} "
-            "were allocated"
-        )
+        if entry is None:
+            _warn_fused_decode_once("no_counters")
+        else:
+            _warn_fused_decode_once("capacity", required, entry.buffer.numel())
         return None
     if torch.compiler.is_compiling():
         return None
@@ -217,11 +243,13 @@ def _fused_decode_available(*, _runtime=None) -> bool:
 def flash_attn_decode_paged_sinks_prepare(
     device: torch.device | str | int, *, _runtime=None
 ) -> bool:
-    """Allocate the one-launch sink decode's counters before graph capture.
+    """Allocate the one-launch sink decode's counters for a device.
 
-    Call it eagerly (for example from the profile run) on the stream that
-    later captures. A no-op, returning False, when the fused decode is
-    switched off or unavailable, or under capture.
+    Counters are per device and must exist before capture; a graph captured
+    on any stream then finds them. The Flash-V100 impl calls this on its
+    first eager sink-layer forward per device (the profile run). A no-op,
+    returning False, when the fused decode is switched off or unavailable,
+    or under capture.
     """
     if not _fused_decode_available(_runtime=_runtime):
         return False
@@ -229,6 +257,22 @@ def flash_attn_decode_paged_sinks_prepare(
     if device.type != "cuda" or _cuda_graph_capture_active():
         return False
     return _fused_decode_counters(device, 0, _runtime=_runtime) is not None
+
+
+def _fused_decode_capture_counts_for(_runtime=None) -> dict:
+    if _runtime is None:
+        return _fused_decode_capture_counts
+    counts = getattr(_runtime, "fused_decode_capture_counts", None)
+    if counts is None:
+        counts = {"fused": 0, "two_launch": 0}
+        _runtime.fused_decode_capture_counts = counts
+    return counts
+
+
+def flash_attn_decode_paged_sinks_capture_counts(*, _runtime=None) -> tuple[int, int]:
+    """Grouped sink decodes captured so far: (one-launch, two-launch)."""
+    counts = _fused_decode_capture_counts_for(_runtime)
+    return counts["fused"], counts["two_launch"]
 
 
 def _xqa_staged_pv_enabled(*, _runtime=None) -> bool:
@@ -1324,21 +1368,24 @@ def flash_attn_decode_paged(
     # Grouped GQA-8 D128 sink layers decode in one launch (partitions and the
     # sink-aware reduction) when the extension has the fused entry point. The
     # extension re-checks the shape and falls back to two launches.
-    fused = (
+    grouped_sinks = (
         sinks is not None
         and head_dim == 128
         and q.shape[1] == 8 * k_cache.shape[2]
         and anchor_lens is None
         and not e4m3_fp32
-        and _fused_decode_available(_runtime=_runtime)
     )
     counters = (
         _fused_decode_counters(
             q.device, batch_capacity * k_cache.shape[2], _runtime=_runtime
         )
-        if fused
+        if grouped_sinks and _fused_decode_available(_runtime=_runtime)
         else None
     )
+    if grouped_sinks and _cuda_graph_capture_active():
+        _fused_decode_capture_counts_for(_runtime)[
+            "two_launch" if counters is None else "fused"
+        ] += 1
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
@@ -2396,6 +2443,7 @@ __all__ = [
     "flash_attn_qk_scores",
     "flash_attn_decode_paged",
     "flash_attn_decode_paged_sinks_available",
+    "flash_attn_decode_paged_sinks_capture_counts",
     "flash_attn_decode_paged_sinks_prepare",
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",

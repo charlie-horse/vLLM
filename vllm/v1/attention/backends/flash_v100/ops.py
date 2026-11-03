@@ -51,6 +51,7 @@ _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
 _paged_kv_utils = None
 _flash_attn_decode_paged_sinks_prepare = None
+_flash_attn_decode_paged_sinks_capture_counts = None
 _flash_attn_decode_paged_sinks_prepare_checked = False
 
 
@@ -161,18 +162,28 @@ def get_flash_ops():
     )
 
 
-def get_flash_decode_sinks_prepare_op():
-    """Eager allocator of the one-launch sink decode's counters, if built."""
+def get_flash_decode_sinks_prepare_ops():
+    """The one-launch sink decode's eager counter allocator and its capture
+    counts (one-launch, two-launch), each None if the package lacks it."""
     global _flash_attn_decode_paged_sinks_prepare
+    global _flash_attn_decode_paged_sinks_capture_counts
     global _flash_attn_decode_paged_sinks_prepare_checked
     if not _flash_attn_decode_paged_sinks_prepare_checked:
         _flash_attn_decode_paged_sinks_prepare_checked = True
         try:
-            from flash_attn_v100 import flash_attn_decode_paged_sinks_prepare
+            import flash_attn_v100
         except ImportError:
-            flash_attn_decode_paged_sinks_prepare = None
-        _flash_attn_decode_paged_sinks_prepare = flash_attn_decode_paged_sinks_prepare
-    return bind_attention_operation(_flash_attn_decode_paged_sinks_prepare)
+            flash_attn_v100 = None
+        _flash_attn_decode_paged_sinks_prepare = getattr(
+            flash_attn_v100, "flash_attn_decode_paged_sinks_prepare", None
+        )
+        _flash_attn_decode_paged_sinks_capture_counts = getattr(
+            flash_attn_v100, "flash_attn_decode_paged_sinks_capture_counts", None
+        )
+    return (
+        bind_attention_operation(_flash_attn_decode_paged_sinks_prepare),
+        bind_attention_operation(_flash_attn_decode_paged_sinks_capture_counts),
+    )
 
 
 def get_flash_grouped_verify_op():
