@@ -389,6 +389,12 @@ predicted: removing launches and a sync point matters beyond kernel time.
    buffer and registers nothing at capture. It was then qualified on its own
    (quality probes and greedy with that switch on and off) before it was
    turned on by default.
+   Never create state lazily that must be zero (or filled) once, such as
+   counters or flags. Under capture the `torch.zeros` is recorded into that
+   one graph, not executed. Graphs captured later then replay on garbage;
+   that is what broke Flint at `--max-num-seqs 20`. Allocate such state
+   eagerly, before capture, and test capture the way the server does: many
+   sizes, largest first, on a side stream, with buffers growing.
 4. **No extra weight copies.** Read the weights the existing route already
    prepared, in place. Use fixed-order reductions, not float atomics, so the
    new path is reproducible.
@@ -432,6 +438,27 @@ the final configuration. Flint scored arithmetic 10/10, coding 5/5, and
 needle at 32K 3/3 (plus 128K and 250K at milestones). These probes catch
 broken numerics and parsers, not small accuracy regressions.
 
+### Serving-config sweep
+
+Treat a change to `--max-num-seqs`, `--max-num-batched-tokens`, CUDA graph
+capture sizes, `--max-model-len`, the KV dtype or the attention backend as a
+code change. These flags change capture sizes, the memory profile and
+workspace sizing, and SM70 fast paths are admitted and sized from them.
+Flint broke this way: at `--max-num-seqs 20`, every request past 64 tokens of
+context decoded gibberish, while the same build was correct at 2. See the
+[postmortem](../design/sm70_flint_max_num_seqs_postmortem.md).
+
+Before any of these changes ships:
+
+1. Run `tools/flint/sm70_validate.sh --stage smoke,quality` with the new
+   value.
+2. Sweep `--max-num-seqs` 2, 3, 4, 8 and the production value, with the
+   default capture list, and once with `--enforce-eager`.
+3. At each value, run greedy to 256 tokens on prompts of 3, 60, 100 and 1,000
+   tokens, at batch 1 and batch 8. **Send each prompt twice**, so the
+   prefix-cache path (a small-q prefill of the uncached tail) runs too.
+   Compare with a golden output from a known-good configuration.
+
 ## Phase 5: deploy
 
 The reference host runs NixOS; the flake lives at `/etc/nixos`, outside git
@@ -462,6 +489,23 @@ The reference host runs NixOS; the flake lives at `/etc/nixos`, outside git
 - **Compile cache.** A deploy that changes compile passes (Flint: the
   AR+RMSNorm fusion) invalidates the torch.compile cache once. Expect the
   first start after it to take longer, and don't mistake that for a hang.
+
+### Switch smoke test
+
+A deploy or config switch is not done until a check that could fail has
+passed. Flint's check after its `--max-num-seqs` switch was 12 concurrent
+"17 × 23" requests. Every answer finished inside 64 tokens and no prompt was
+re-sent, so it could not see the regression. After every switch, run:
+
+1. a prompt of at least 1,000 tokens whose answer is checkable (a needle, or
+   a coding task run against asserts);
+2. one greedy generation of at least 256 tokens, compared with a stored
+   golden output from the previous generation;
+3. the same long prompt sent a second time (prefix-cache hit);
+4. one batch of concurrent requests at the new `--max-num-seqs`.
+
+If any of them fails, roll back to the previous NixOS generation
+automatically.
 
 ### RAM guard
 
@@ -632,11 +676,15 @@ Phase 4, validate:
 - [ ] Every flip at a near-tie, or attributed with an all-switches-off
       control
 - [ ] Quality probes pass
+- [ ] Serving-config sweep (max-num-seqs 2/3/4/8/production, eager): greedy
+      256 on 3/60/100/1,000-token prompts, each sent twice, batch 1 and 8
 
 Phases 5 and 6, deploy and coordinate:
 
 - [ ] Nix build; conversion as a cached build step; converter pinned
       separately
+- [ ] Switch smoke test: ≥ 1K-token checkable prompt, greedy ≥ 256 vs
+      golden, re-sent prompt, concurrency; auto-rollback on failure
 - [ ] RAM guard running before the switch; LMCache without expandable
       segments
 - [ ] GPU grants through the coordinator; one tree per agent; WIP committed
