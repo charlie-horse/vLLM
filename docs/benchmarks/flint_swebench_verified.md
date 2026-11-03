@@ -141,7 +141,15 @@ Audit by Nadia:
   repos in the images contain no fix commits.
 - All 6 context overflows hit at 191–196K prompt tokens: prompt + `max_tokens` 65536 exceeded the 262144 window. These are model failures (the agent's history grew too long); none were re-run.
 - No instance hit the 250-step limit; 494 of 500 agents submitted.
-- The 8 non-standard wrong patches (no tests collected, missing module, patch did not apply) are counted as model failures; manual audit pending.
+- The 8 wrong patches with non-standard analyzer labels (no tests
+  collected, missing module, patch did not apply) were audited by hand.
+  All 8 patches applied cleanly and all 8 are model failures:
+  - 4 ran normally and failed the target test (the label was wrong).
+  - 3 hit import errors because the hidden tests import helpers or
+    dependencies the model's patch didn't add (pylint 4551, 4604, 4661).
+  - 1 crashed the test run with the original bug (django 10554).
+  None showed a missing image dependency, network error, timeout, OOM or
+  killed container.
 
 ## Results
 
@@ -182,7 +190,8 @@ With eval test timeouts counted as model failures (`--timeout-is-model`):
 
 Infra-excluded instances and reasons: none.
 
-Of the wrong patches, 1 failed to apply.
+Of the wrong patches, 0 failed to apply. `django__django-10554` is reported
+as not applied only because its test run crashed (audit above).
 
 ## Cost
 
