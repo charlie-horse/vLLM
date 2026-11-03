@@ -6,23 +6,30 @@
 #   runs/attA/{agent/ID, eval/done_ID, log/ID.{agent,eval}.log}
 # done_ID may carry "infra": "pull_failed" | "api_failed".
 # Exit 3 = killed by the memory watchdog (no done_ marker -> re-run later).
+# Env knobs (unset = previous behavior):
+#   RUN_DIR=$R/runs      run root; output goes to $RUN_DIR/attA
+#   TASK_CPUS=N          task container --cpus (flint.yaml default: 6)
+#   KEEP_IMAGES=1        skip cleanup_image (images were pre-pulled)
+#   START_FLOOR_GB=12    wait for this much MemAvailable before starting
 set -u
 . "$HOME/flint-swebench/env.sh"
 : "${FLINT_API_BASE:?}"
-ID=$1; A=$2; OUT=$R/runs/att$A; ST=$R/state
+RUN_DIR=${RUN_DIR:-$R/runs}
+ID=$1; A=$2; OUT=$RUN_DIR/att$A; ST=$R/state
+START_FLOOR_GB=${START_FLOOR_GB:-12}
 mkdir -p "$OUT/agent" "$OUT/eval" "$OUT/log" "$ST/active"
 REPORT=$OUT/eval/done_$ID
 [ -f "$REPORT" ] && exit 0
 LOG=$OUT/log/$ID.run.log
 TAG=$(echo "$ID" | sed 's/__/_1776_/' | tr 'A-Z' 'a-z')
 IMG=docker.io/swebench/sweb.eval.x86_64.$TAG:latest
-PULL_GAP=240                                # >= 4 min between pulls (global)
-PULL_BACKOFF=(0 120 240 480 960 1920 3600)  # s: then 2,4,8,16,32,60 min
 API_RE='^(APIConnectionError|APIError|Timeout|InternalServerError'
 API_RE+='|ServiceUnavailableError|BadGatewayError|APIResponseValidationError)$'
 agent_s=0; eval_s=0
 
-log() { echo "$(date '+%F %T') [$ID a$A] $*" | tee -a "$LOG" >> "$R/runs/driver.log"; }
+log() {
+  echo "$(date '+%F %T') [$ID a$A] $*" | tee -a "$LOG" >> "$RUN_DIR/driver.log"
+}
 memavail_gb() { awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo; }
 done_marker() {  # $1 = infra reason or empty
   local infra=""; [ -n "${1:-}" ] && infra=",\"infra\":\"$1\""
@@ -30,6 +37,7 @@ done_marker() {  # $1 = infra reason or empty
     > "$REPORT"
 }
 cleanup_image() {
+  [ "${KEEP_IMAGES:-0}" = 1 ] && return 0
   # Hold the pull lock so pruning cannot drop shared layers mid-pull.
   (
     flock 9
@@ -40,36 +48,21 @@ cleanup_image() {
 memkilled() { [ -f "$ST/memkill_$ID" ]; }
 finish_memkill() {
   log "memory watchdog killed this instance; no done_ marker, will re-run"
-  rm -f "$ST/memkill_$ID" "$ST/active/$ID"
+  rm -f "$ST/memkill_$ID" "$ST/active/$ID" "$ST/pid_$ID"
   cleanup_image; exit 3
 }
 
 # --- memory guard: wait for headroom before starting
-while [ "$(memavail_gb)" -lt 12 ]; do
-  log "waiting: MemAvailable $(memavail_gb)G < 12G"; sleep 30
+while [ "$(memavail_gb)" -lt "$START_FLOOR_GB" ]; do
+  log "waiting: MemAvailable $(memavail_gb)G < ${START_FLOOR_GB}G"; sleep 30
 done
 "$R/scripts/podman_service.sh" || { log "podman service down"; exit 4; }
 echo "$IMG" > "$ST/active/$ID"; rm -f "$ST/memkill_$ID"
 
 # --- a. pre-pull, globally rate limited, with backoff
-pull_once() {
-  (
-    flock 9
-    last=$(cat "$ST/last_pull" 2>/dev/null || echo 0)
-    gap=$(( last + PULL_GAP - $(date +%s) ))
-    [ "$gap" -gt 0 ] && sleep "$gap"
-    date +%s > "$ST/last_pull"
-    nice -n 19 ionice -c3 timeout 3600 podman pull -q "$IMG"
-  ) 9>"$ST/pull.lock" >> "$LOG" 2>&1
-}
+. "$R/scripts/pull_lib.sh"
 pulled=0
-for d in "${PULL_BACKOFF[@]}"; do
-  if [ "$d" -gt 0 ]; then log "pull failed, retry in $((d / 60)) min"; sleep "$d"; fi
-  if podman image exists "$IMG" || pull_once; then pulled=1; break; fi
-  if tail -5 "$LOG" | grep -qiE 'manifest unknown|name unknown|repository does not exist'; then
-    log "image does not exist upstream"; break
-  fi
-done
+pull_image && pulled=1
 if [ $pulled = 0 ]; then
   log "pull_failed"; done_marker pull_failed; rm -f "$ST/active/$ID"; exit 0
 fi
@@ -93,6 +86,22 @@ for f in sorted(glob.glob(f"{d}/exit_statuses_*.yaml"), reverse=True):
             print(st); sys.exit()
 PY
 }
+# watchdog kills the PID in $ST/pid_$ID (no pkill -f); run in bg + wait
+run_tracked() {
+  local rc; "$@" & echo $! > "$ST/pid_$ID"; wait $!; rc=$?
+  rm -f "$ST/pid_$ID"; return $rc
+}
+CPU_ARGS=()
+if [ -n "${TASK_CPUS:-}" ]; then  # flint.yaml run_args with --cpus replaced
+  CPU_ARGS=(-c "environment.run_args=$("$R/.venv/bin/python" -I - \
+    "$R/flint.yaml" "$TASK_CPUS" <<'PY'
+import json, sys, yaml
+args = yaml.safe_load(open(sys.argv[1]))["environment"]["run_args"]
+args = [a for a in args if not a.startswith("--cpus")]
+print(json.dumps(args + [f"--cpus={sys.argv[2]}"]))
+PY
+)")
+fi
 cd "$R"
 status=""
 for try in 1 2 3; do
@@ -103,9 +112,9 @@ for try in 1 2 3; do
   wait_endpoint
   log "agent start (try $try)"
   t0=$(date +%s)
-  PYTHONPATH=$R/adapter timeout 6h nice -n 19 ionice -c3 \
+  PYTHONPATH=$R/adapter run_tracked timeout 6h nice -n 19 ionice -c3 \
     "$R/.venv/bin/mini-extra" swebench --subset verified --split test \
-    --filter "^${ID}\$" -c swebench.yaml -c "$R/flint.yaml" \
+    --filter "^${ID}\$" -c swebench.yaml -c "$R/flint.yaml" "${CPU_ARGS[@]}" \
     -c "model.model_kwargs.api_base=$FLINT_API_BASE" \
     -w 1 -o "$OUT/agent/$ID" > "$OUT/log/$ID.agent.log" 2>&1
   agent_s=$(( agent_s + $(date +%s) - t0 ))
@@ -124,7 +133,8 @@ fi
 t1=$(date +%s)
 cd "$OUT/eval"
 if [ -s "$OUT/agent/$ID/preds.json" ]; then
-  nice -n 19 ionice -c3 "$R/.venv/bin/python" -m swebench.harness.run_evaluation \
+  run_tracked nice -n 19 ionice -c3 \
+    "$R/.venv/bin/python" -m swebench.harness.run_evaluation \
     -d SWE-bench/SWE-bench_Verified -s test -i "$ID" \
     -p "$OUT/agent/$ID/preds.json" --max_workers 1 -id "att${A}_$ID" \
     --timeout 1800 > "$OUT/log/$ID.eval.log" 2>&1

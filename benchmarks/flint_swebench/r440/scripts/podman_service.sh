@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # (re)start the rootless podman API socket used by the swebench docker SDK
+# CPUSET set (run_all.sh): start the service pinned with taskset -c.
 . $HOME/flint-swebench/env.sh
+SOCK=$XDG_RUNTIME_DIR/podman/podman.sock
+ping() { curl -s -m "$1" --unix-socket $SOCK http://d/_ping | grep -q OK; }
 mkdir -p $XDG_RUNTIME_DIR/podman
-if curl -s -m 5 --unix-socket $XDG_RUNTIME_DIR/podman/podman.sock http://d/_ping | grep -q OK; then exit 0; fi
-rm -f $XDG_RUNTIME_DIR/podman/podman.sock
-nohup setsid nice -n 19 ionice -c3 $PODMAN system service --time=0 \
-  unix://$XDG_RUNTIME_DIR/podman/podman.sock > $R/run/podman-service.log 2>&1 < /dev/null &
+if ping 5; then exit 0; fi
+rm -f $SOCK
+PIN=(); [ -n "${CPUSET:-}" ] && PIN=(taskset -c "$CPUSET")
+nohup setsid "${PIN[@]}" nice -n 19 ionice -c3 $PODMAN system service --time=0 \
+  unix://$SOCK > $R/run/podman-service.log 2>&1 < /dev/null &
 for i in $(seq 1 20); do
-  curl -s -m 2 --unix-socket $XDG_RUNTIME_DIR/podman/podman.sock http://d/_ping | grep -q OK && exit 0
+  ping 2 && exit 0
   sleep 0.5
 done
 echo "podman service failed to start" >&2; exit 1
