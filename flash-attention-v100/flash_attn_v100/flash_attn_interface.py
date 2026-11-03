@@ -1375,14 +1375,17 @@ def flash_attn_decode_paged(
         and anchor_lens is None
         and not e4m3_fp32
     )
+    # With the fused decode switched off or not built, nothing here touches
+    # counters or capture state: the route is the two-launch decode.
+    fused_ok = grouped_sinks and _fused_decode_available(_runtime=_runtime)
     counters = (
         _fused_decode_counters(
             q.device, batch_capacity * k_cache.shape[2], _runtime=_runtime
         )
-        if grouped_sinks and _fused_decode_available(_runtime=_runtime)
+        if fused_ok
         else None
     )
-    if grouped_sinks and _cuda_graph_capture_active():
+    if fused_ok and _cuda_graph_capture_active():
         _fused_decode_capture_counts_for(_runtime)[
             "two_launch" if counters is None else "fused"
         ] += 1

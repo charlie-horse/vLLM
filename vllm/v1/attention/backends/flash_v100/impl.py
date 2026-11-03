@@ -43,26 +43,25 @@ from vllm.v1.attention.ops.sm70_grouped import (
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
-# (prepare op, device index) already given the one-launch sink decode's
-# counters; shared by every layer.
-_FUSED_DECODE_PREPARED: set[tuple[int, int]] = set()
-# Set while sink layers are being captured; the next eager forward logs how
-# the captured graphs decode the grouped sink layers.
+# Set while sink layers are being captured; the next eager forward reports
+# how the captured graphs decode the grouped sink layers. The last counts
+# reported, so each distinct total is logged once.
 _SINK_CAPTURE_PENDING = [False]
+_SINK_CAPTURE_REPORTED: list[tuple[int, int] | None] = [None]
 
 
 def _log_sink_capture_summary(counts) -> None:
     if counts is None:
         return
-    fused, two_launch = counts()
-    if not fused and not two_launch:
+    totals = tuple(counts())
+    if not any(totals) or totals == _SINK_CAPTURE_REPORTED[0]:
         return
-    log = logger.warning if two_launch else logger.info
-    log(
+    _SINK_CAPTURE_REPORTED[0] = totals
+    # INFO only: each fallback already warned with its reason when captured.
+    logger.info(
         "Flash-V100 grouped sink decode in captured CUDA graphs so far: %d "
         "one-launch, %d two-launch (partition kernel plus reducer).",
-        fused,
-        two_launch,
+        *totals,
     )
 
 
@@ -77,6 +76,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     _flash_v100_sink_rejection: str | None = None
     flash_attn_decode_paged_sinks_prepare = None
     flash_attn_decode_paged_sinks_capture_counts = None
+    # Set once this layer asked for the device's counters on an eager call.
+    _flash_v100_fused_decode_ready = False
 
     allow_triton_fallback = _config.ConfigField[bool]("allow_triton_fallback")
     compare_bhmd_out_dir = _config.ConfigField[str | None]("compare_bhmd_out_dir")
@@ -886,35 +887,32 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_triton_prefill,
         )
 
-    def _prepare_fused_sink_decode(self, query: torch.Tensor) -> None:
+    def _prepare_fused_sink_decode(
+        self, query: torch.Tensor, is_capturing: bool
+    ) -> None:
         """Allocate the one-launch sink decode's counters on an eager forward.
 
-        The counters are per device, so graphs captured on any stream find
-        them once they exist. The first eager sink-layer forward (the profile
-        run, which precedes every capture with or without capture warmups)
-        allocates them, zeroed. Under capture nothing is allocated: a graph
-        without counters decodes with two launches. The first eager forward
-        after a capture logs how the captured graphs decode. prepare is a
-        no-op when VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0.
+        Called for sink layers only. The counters are per device, so graphs
+        captured on any stream find them once they exist. Each layer's first
+        eager forward (the profile run, which precedes every capture with or
+        without capture warmups) asks for them; prepare is an idempotent
+        cache lookup that allocates them, zeroed, once per device, and a
+        no-op when VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0. Under capture nothing
+        is allocated: a graph without counters decodes with two launches. The
+        first eager forward after a capture reports new capture totals.
         """
-        prepare = self.flash_attn_decode_paged_sinks_prepare
-        if (
-            prepare is None
-            or self._flash_v100_sinks is None
-            or query.device.type != "cuda"
-        ):
-            return
-        if _routing.is_cuda_graph_capturing(query):
+        if is_capturing:
             _SINK_CAPTURE_PENDING[0] = True
             return
         if _SINK_CAPTURE_PENDING[0]:
             _SINK_CAPTURE_PENDING[0] = False
             _log_sink_capture_summary(self.flash_attn_decode_paged_sinks_capture_counts)
-        key = (id(prepare), query.device.index or 0)
-        if key in _FUSED_DECODE_PREPARED:
+        if self._flash_v100_fused_decode_ready:
             return
-        _FUSED_DECODE_PREPARED.add(key)
-        prepare(query.device)
+        self._flash_v100_fused_decode_ready = True
+        prepare = self.flash_attn_decode_paged_sinks_prepare
+        if prepare is not None and query.device.type == "cuda":
+            prepare(query.device)
 
     def forward(
         self,
@@ -937,7 +935,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
           production decode. Mixed Triton/Flash routes are never silent.
         """
 
-        self._prepare_fused_sink_decode(query)
+        is_capturing = _routing.is_cuda_graph_capturing(query)
+        if self._flash_v100_sinks is not None and (
+            is_capturing
+            or _SINK_CAPTURE_PENDING[0]
+            or not self._flash_v100_fused_decode_ready
+        ):
+            self._prepare_fused_sink_decode(query, is_capturing)
         if attn_metadata is None:
             assert output is not None
             if (
@@ -995,7 +999,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         assert output is not None
         is_prefill = attn_metadata.max_query_len > 1
-        is_capturing = _routing.is_cuda_graph_capturing(query)
         layer_name = self._layer_debug_info(layer).get("layer_name")
         self._observe_forward(
             query,

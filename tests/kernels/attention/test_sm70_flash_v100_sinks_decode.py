@@ -526,6 +526,8 @@ def fresh_decode_caches(sm70_fused, monkeypatch):
         monkeypatch.setattr(interface, name, {})
     monkeypatch.setattr(interface, "_fused_decode_warned", set())
     monkeypatch.setenv(FUSED_ENV, "1")
+    # The capture bug needs the default shared decode workspace.
+    monkeypatch.setenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1")
     return sm70_fused
 
 
@@ -734,15 +736,13 @@ def test_decode_sinks_fused_capture_on_fresh_stream(
 
 
 def _dirty_graph_pool(device, pool, stream):
-    """Leave freed graph-pool memory (and cached blocks) full of 0x7fffffff.
+    """Leave freed memory of the shared graph pool full of 0x7fffffff.
 
-    A tensor allocated in a throwaway capture on the shared pool is filled
-    by one replay and then freed, so the next captures on the pool reuse
-    poisoned memory instead of whatever cudaMalloc happened to return.
+    Tensors allocated in a throwaway capture on the pool are filled by one
+    replay and then freed, so the next captures on the pool reuse poisoned
+    memory instead of whatever cudaMalloc happened to return.
     """
     numel = 64 << 20  # 256 MiB of int32
-    eager = torch.full((numel,), 0x7FFFFFFF, dtype=torch.int32, device=device)
-    del eager
     poison = torch.cuda.CUDAGraph()
     with torch.cuda.graph(poison, pool=pool, stream=stream):
         # One large-pool block, and small-pool (<1 MiB) blocks filling 2 MiB
@@ -776,6 +776,8 @@ def test_decode_sinks_descending_capture_regression(sm70_fused, monkeypatch, win
     monkeypatch.setattr(interface, "_decode_workspace_cache", {})
     monkeypatch.setattr(interface, "_fused_decode_counter_cache", {}, raising=False)
     monkeypatch.setattr(interface, "_fused_decode_warned", set(), raising=False)
+    # The capture bug needs the default shared decode workspace.
+    monkeypatch.setenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1")
     monkeypatch.setenv(FUSED_ENV, "1")
     rows, capacity = 8, 8192
     k_cache, v_cache, block_table = _paged_kv([capacity] * rows, 2, 16, device, 141)
@@ -1135,72 +1137,97 @@ def test_fused_counters_optional_per_launch_zero(cpu_interface, monkeypatch):
     assert torch.all(counters[rows:] == 7)
 
 
-def test_impl_prepares_fused_counters_once_per_device(monkeypatch, caplog):
-    """The first eager sink-layer forward allocates the device's counters,
-    once for every layer; the first eager forward after a capture logs how
-    the captured graphs decode."""
+def test_impl_prepares_fused_counters_once_per_layer(monkeypatch):
+    """Each sink layer's first eager forward asks for the device's counters
+    once (prepare itself is an idempotent per-device lookup); the first eager
+    forward after a capture reports new capture totals, once per total."""
     from vllm.v1.attention.backends.flash_v100 import impl as _impl
 
     calls: list[torch.device] = []
-    capturing = [True]
     counts = [(0, 0)]
     logged: list[str] = []
-    monkeypatch.setattr(_impl, "_FUSED_DECODE_PREPARED", set())
     monkeypatch.setattr(_impl, "_SINK_CAPTURE_PENDING", [False])
+    monkeypatch.setattr(_impl, "_SINK_CAPTURE_REPORTED", [None])
     monkeypatch.setattr(
         _impl.logger, "info", lambda msg, *args: logged.append(msg % args)
     )
     monkeypatch.setattr(
         _impl.logger, "warning", lambda msg, *args: logged.append("W " + msg % args)
     )
-    monkeypatch.setattr(
-        _impl._routing, "is_cuda_graph_capturing", lambda tensor: capturing[0]
-    )
-
-    prepare = calls.append  # one bound op, as runtime.bind caches it
 
     def new_layer():
         layer = _impl.FlashAttnV100Impl.__new__(_impl.FlashAttnV100Impl)
-        layer.flash_attn_decode_paged_sinks_prepare = prepare
+        layer.flash_attn_decode_paged_sinks_prepare = calls.append
         layer.flash_attn_decode_paged_sinks_capture_counts = lambda: counts[0]
+        layer._flash_v100_sinks = torch.zeros(16, dtype=torch.float32)
         return layer
 
     first, second = new_layer(), new_layer()
     query = SimpleNamespace(device=torch.device("cuda", 0))
-    first._prepare_fused_sink_decode(query)
-    assert calls == []  # no sinks admitted
-    for layer in (first, second):
-        layer._flash_v100_sinks = torch.zeros(16, dtype=torch.float32)
-    first._prepare_fused_sink_decode(query)
+    first._prepare_fused_sink_decode(query, True)
     assert calls == []  # under capture: nothing allocated
-    capturing[0] = False
-    first._prepare_fused_sink_decode(query)  # profile run
-    second._prepare_fused_sink_decode(query)
-    assert calls == [query.device]
-    second._prepare_fused_sink_decode(SimpleNamespace(device=torch.device("cuda", 1)))
-    assert calls == [query.device, torch.device("cuda", 1)]
-    # A capture, then the first eager forward reports it once.
-    capturing[0] = True
-    counts[0] = (14, 0)
-    first._prepare_fused_sink_decode(query)
-    second._prepare_fused_sink_decode(query)
-    capturing[0] = False
-    first._prepare_fused_sink_decode(query)
-    second._prepare_fused_sink_decode(query)
-    assert logged == [
-        "Flash-V100 grouped sink decode in captured CUDA graphs so far: 14 "
-        "one-launch, 0 two-launch (partition kernel plus reducer)."
-    ]
-    capturing[0] = True
-    counts[0] = (14, 3)
-    first._prepare_fused_sink_decode(query)
-    capturing[0] = False
-    first._prepare_fused_sink_decode(query)
-    assert logged[-1].startswith("W ") and "14 one-launch, 3 two-launch" in logged[-1]
+    first._prepare_fused_sink_decode(query, False)  # profile run
+    first._prepare_fused_sink_decode(query, False)
+    second._prepare_fused_sink_decode(query, False)
+    assert calls == [query.device] * 2
+    assert first._flash_v100_fused_decode_ready
+    assert logged == []  # nothing captured yet: (0, 0) is not reported
+    report = (
+        "Flash-V100 grouped sink decode in captured CUDA graphs so far: "
+        "{} one-launch, {} two-launch (partition kernel plus reducer)."
+    )
+    # Two captured sizes with their per-size warmups and the same totals:
+    # one report. New totals: one more report, INFO even with a fallback.
+    for totals in ((14, 0), (14, 0), (14, 3)):
+        counts[0] = totals
+        first._prepare_fused_sink_decode(query, True)
+        second._prepare_fused_sink_decode(query, False)
+        first._prepare_fused_sink_decode(query, False)
+    assert logged == [report.format(14, 0), report.format(14, 3)]
     cpu = new_layer()
-    cpu._flash_v100_sinks = first._flash_v100_sinks
-    cpu._prepare_fused_sink_decode(SimpleNamespace(device=torch.device("cpu")))
-    assert len(calls) == 2
+    cpu._prepare_fused_sink_decode(SimpleNamespace(device=torch.device("cpu")), False)
+    assert calls == [query.device] * 2
+
+
+def test_impl_forward_skips_the_hook_once_ready(monkeypatch):
+    """Eager forwards of a ready sink layer reuse forward's capture probe and
+    do not enter the hook; sink-free layers never do."""
+    from vllm.v1.attention.backends.flash_v100 import impl as _impl
+
+    entered: list[bool] = []
+    probes: list[object] = []
+    monkeypatch.setattr(_impl, "_SINK_CAPTURE_PENDING", [False])
+
+    def probe(tensor) -> bool:
+        probes.append(tensor)
+        return False
+
+    monkeypatch.setattr(_impl._routing, "is_cuda_graph_capturing", probe)
+    monkeypatch.setattr(
+        _impl.FlashAttnV100Impl,
+        "_prepare_fused_sink_decode",
+        lambda self, query, is_capturing: entered.append(is_capturing),
+    )
+    monkeypatch.setattr(_impl._routing, "record_route", lambda *args, **kwargs: None)
+    layer = _impl.FlashAttnV100Impl.__new__(_impl.FlashAttnV100Impl)
+    layer.attn_type = None
+    query = torch.zeros((1, 16, HEAD_DIM), dtype=torch.float16)
+    output = torch.ones_like(query)
+
+    def forward():
+        layer.forward(None, query, query, query, None, None, output)
+
+    forward()  # sink-free
+    assert entered == [] and len(probes) == 1
+    layer._flash_v100_sinks = torch.zeros(16, dtype=torch.float32)
+    forward()
+    assert entered == [False]
+    layer._flash_v100_fused_decode_ready = True
+    forward()
+    assert entered == [False] and len(probes) == 3
+    _impl._SINK_CAPTURE_PENDING[0] = True
+    forward()
+    assert entered == [False, False]
 
 
 def test_fused_decode_capture_counts(cpu_interface, monkeypatch):
@@ -1213,9 +1240,18 @@ def test_fused_decode_capture_counts(cpu_interface, monkeypatch):
     _capturing(monkeypatch, interface, True)
     interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
     interface.flash_attn_decode_paged(q, k, v, table, lens)  # sink-free: uncounted
-    monkeypatch.setenv(FUSED_ENV, "0")
+    interface.flash_attn_decode_paged(q[:2], k, v, table[:2], lens[:2], sinks=sinks)
+    monkeypatch.setattr(interface, "FUSED_DECODE_COUNTER_CAPACITY", 1)
+    interface._fused_decode_counter_cache.clear()
     interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
-    assert interface.flash_attn_decode_paged_sinks_capture_counts() == (1, 1)
+    assert interface.flash_attn_decode_paged_sinks_capture_counts() == (2, 1)
+    # Switched off on purpose: no counters, no capture state, no warning.
+    monkeypatch.setenv(FUSED_ENV, "0")
+    warned = set(interface._fused_decode_warned)
+    interface.flash_attn_decode_paged(q, k, v, table, lens, sinks=sinks)
+    assert interface.flash_attn_decode_paged_sinks_capture_counts() == (2, 1)
+    assert interface._fused_decode_counter_cache == {}
+    assert interface._fused_decode_warned == warned
     runtime = SimpleNamespace()
     assert interface.flash_attn_decode_paged_sinks_capture_counts(_runtime=runtime) == (
         0,
