@@ -247,6 +247,88 @@ f27f57b flint_swebench: r440 podman runner and infra-aware analysis
 fb1e808 Add SWE-bench Verified harness for Flint (mini-swe-agent)
 ```
 
+## Follow-up: quality gate for `--max-num-seqs 20` (Nov 3–4)
+
+The server moved from `--max-num-seqs 2` to 20, and that triggered a
+regression: gibberish after about 64 tokens, set off by concurrent and
+prefix-cache-hit requests. After the fix, two gates checked it.
+
+### Gate A: coherence (fixed build, hand-run, seqs 20)
+
+Suite: `benchmarks/flint_coherence/` (`gate_a.py`, `near_tie.py`).
+
+- 24 greedy prompts (code, math, prose, 8K–32K context), run at
+  concurrency 1, 4 and 16, plus a repeat pass that re-sends every prompt
+  (prefix-cache hits). Every output passes the gibberish detectors (zlib
+  ratio, 8-gram repetition, non-ASCII ratio, Python parse), with 0 request
+  errors.
+- Greedy output is not bit-reproducible: it diverges from the c1 reference
+  after 30–600 tokens, even on a c1 resend. Two checks show these are
+  near-ties, not corruption:
+  - A review panel judged all 96 divergences benign.
+  - At the divergence index, the top-1/top-2 logprob gap is < 0.5 nats for
+    79/83 checked points (median 0.11, max 1.09, the larger ones synonym
+    swaps). Only 7% of all positions have a gap that small.
+- `prompt_logprobs` (teacher-forced scoring) ran out of GPU memory and took
+  the server down at a 2.1K-token context with 0.90 GPU utilization. This
+  was already known and is tracked separately. That check is dropped for
+  this box.
+- `chat_template_kwargs.enable_thinking=false` is ignored: the template
+  renders the same prompt either way. Tracked separately.
+
+Verdict: PASS. The gibberish regression is fixed.
+
+### Gate B: 50-task SWE-bench slice (production unit, seqs 20, LMCache)
+
+Same agent and eval config as the 500-instance run. The slice is 50
+instances, stratified by repo with seed 0 (`r440/slice50_ids.txt`). Run at
+P=12 on production fork `e66530b` (fix `7b2bace`), Nov 4 06:47–12:01 EST.
+
+| | Baseline, same 50 ids (seqs 2, P2) | Gate B (seqs 20, P12) |
+|---|---|---|
+| Resolved | 37/50 (74.0%) | 32/50 (64.0%), Wilson 50.1–75.9% |
+| Discordant | 7 baseline-only | 2 run-only |
+| Paired test | | McNemar exact p = 0.18 |
+| Infra-excluded | 0 | 0 |
+| Mean turns / completion tokens | 65.4 / 39.2K | 74.8 / 40.7K |
+| Median agent wall per task | 606 s | 2,870 s |
+| Aggregate completion tok/s | 70.7 (full run) | 108 (server counter: ~110) |
+| Wall for 50 tasks | ~6.1 h (estimated, at P2) | 5.2 h |
+
+Audit:
+
+- All 9 discordant instances were read side by side. Every one is a
+  coherent trajectory with a different fix, so they are reasoning variance.
+  Example: sklearn-14629 patched `_validation` instead of adding
+  `MultiOutputClassifier.classes_`.
+- A mechanical scan of all trajectories in both runs finds the same rates
+  in each:
+  - messages with an 8-gram repeated ≥5×: 48/2537 vs 50/2356
+  - zlib outliers: 2 vs 3
+  - format errors: 0 vs 1
+  - `finish_reason=length`: 0 vs 0
+  - non-ASCII: 0.31% vs 0.26%, all ordinary punctuation
+- There is no sign of the regression in agent output.
+
+Confounds:
+
+- Task containers got `--cpus=1` (12 in parallel) instead of 6. That gave
+  157 vs 37 tool-command timeouts and longer trajectories. For example,
+  django-14792 hit 28 timeouts, all after its fix was already chosen.
+- One run-only win, matplotlib-21568, copied the fix from a newer matplotlib
+  wheel cached in the image's pip cache. That is leakage. Without it the
+  slice is 31/50.
+
+Verdict:
+
+- No detectable quality regression at this sample size. The 10-point gap is
+  not significant (p = 0.18), and no failure traces to the server.
+- 50 tasks cannot rule out a drop of a few points; that would need a larger
+  rerun with `--cpus` matched.
+- Throughput: about 1.5× aggregate generation per wall hour. Per-task
+  latency is about 4.7× higher, so end-to-end wall for a fixed batch
+  improved only about 1.2×.
+
 ## Reproduction
 
 Files: `benchmarks/flint_swebench/` (r440 copies in `r440/`, installed on
