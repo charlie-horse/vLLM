@@ -26,10 +26,11 @@ let
   # Converter pin: the tree whose vllm.models.flint.convert_gguf produced the
   # checkpoint. It is fetched, not taken from this repo, because the
   # checkpoint is input-addressed: any change to the converter's build inputs
-  # gives it a new store path and reconverts (~4 min, a new 23 GB path). Only
-  # bump it when the converter or the checkpoint format changes. To bump: set
-  # rev, then `nix flake prefetch --json github:charlie-horse/1Cat-vLLM/<rev>`
-  # and paste its "hash".
+  # gives it a new store path and reconverts (a new 23 GB path; timing at
+  # mkCheckpoint). Only bump it when the converter or the checkpoint format
+  # changes. To bump: set rev, then
+  # `nix flake prefetch --json github:charlie-horse/vLLM/<rev>` and paste its
+  # "hash".
   converterFork = {
     rev = "f66728d9b95e44dd6526b0f2033832477e6a79de"; # claude/flint-v100-pcie
     hash = "sha256-PmWgtyrqJ6KMllN/NqYjhNgrwSypGtQ4xk1BP1ADQfk=";
@@ -45,6 +46,9 @@ let
     rev = "2a247be0c0aec895ccb0ac7ca92229ec6df37288";
   };
 
+  # The repo was renamed to charlie-horse/vLLM; GitHub redirects the old name.
+  # Left as is on purpose: changing owner/repo changes this fetch's .drv (and
+  # so every dependent drvPath, though not the output paths).
   fetchFork =
     pin:
     pkgs.fetchFromGitHub {
@@ -233,7 +237,8 @@ in
     version = "1.5.1.dev0+flint.${builtins.substring 0 7 converterFork.rev}";
   };
 
-  # ~23 GB, ~2 min on 14 cores, ~25 GB peak RAM.
+  # ~23 GB output, ~25 GB peak RAM. Mostly disk-bound: a few minutes on an
+  # SSD; ~15 min on r440's HDDs (2026-11-04, run alone).
   # Takes the wrapped converterTree (package.nix). Input-addressed: its store
   # path changes whenever converterTree's derivation does.
   mkCheckpoint =

@@ -20,8 +20,9 @@ Both modules build their packages with the host's `pkgs`, once
 
 ## Files
 
-- `source.nix`: the repo minus `nix/`, `flake.nix` and `flake.lock`. Commits
-  that only touch those don't rebuild the ~25 min CUDA tree.
+- `source.nix`: the repo minus `nix/`, `flake.nix`, `flake.lock`, `.claude/`
+  and `.gitignore` (docs are included). Commits that only touch those don't
+  rebuild the ~25 min CUDA tree.
 - `flint.nix`: the in-place sm_70 build, the pre-fetched CMake deps, the
   weights fetches and the conversion. The converter has its own fetched pin
   (`converterFork`) so the 23 GB checkpoint keeps its store path; bump it only
