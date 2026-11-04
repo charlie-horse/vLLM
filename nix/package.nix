@@ -56,10 +56,12 @@ let
         CC = "${cuda.backendStdenv.cc}/bin/cc";
         CXX = "${cuda.backendStdenv.cc}/bin/c++";
         SETUPTOOLS_SCM_PRETEND_VERSION = "0.5.6";
-        MAX_JOBS = "16";
       };
       # torch's CUDA libs ship in the nvidia-* wheels; the build imports torch.
       preBuild = (old.preBuild or "") + ''
+        # nvcc needs a few GB per job: follow the builder's cores, capped at 16
+        # (as flint.nix does), so a parallel build can't exhaust the host's RAM.
+        export MAX_JOBS=$(( NIX_BUILD_CORES > 16 ? 16 : NIX_BUILD_CORES ))
         export LD_LIBRARY_PATH="$(find -L ${
           lib.concatMapStringsSep " " (n: "${final.${n}}/${python.sitePackages}") (
             lib.filter (lib.hasPrefix "nvidia-") (lib.attrNames final)
