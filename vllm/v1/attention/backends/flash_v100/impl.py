@@ -54,11 +54,15 @@ def _log_sink_capture_summary(counts) -> None:
     if counts is None:
         return
     totals = tuple(counts())
-    if not any(totals) or totals == _SINK_CAPTURE_REPORTED[0]:
+    previous = _SINK_CAPTURE_REPORTED[0]
+    if not any(totals) or totals == previous:
         return
     _SINK_CAPTURE_REPORTED[0] = totals
-    # INFO only: each fallback already warned with its reason when captured.
-    logger.info(
+    # The totals grow with every captured size, so INFO only for the first
+    # report or a new two-launch fallback; later growth goes to DEBUG. Each
+    # fallback already warned with its reason when it was captured.
+    first_or_fallback = previous is None or totals[1] != previous[1]
+    (logger.info if first_or_fallback else logger.debug)(
         "Flash-V100 grouped sink decode in captured CUDA graphs so far: %d "
         "one-launch, %d two-launch (partition kernel plus reducer).",
         *totals,

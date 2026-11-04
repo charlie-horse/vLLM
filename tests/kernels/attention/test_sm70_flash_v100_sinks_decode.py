@@ -1176,14 +1176,21 @@ def test_impl_prepares_fused_counters_once_per_layer(monkeypatch):
         "Flash-V100 grouped sink decode in captured CUDA graphs so far: "
         "{} one-launch, {} two-launch (partition kernel plus reducer)."
     )
-    # Two captured sizes with their per-size warmups and the same totals:
-    # one report. New totals: one more report, INFO even with a fallback.
-    for totals in ((14, 0), (14, 0), (14, 3)):
+    debug: list[str] = []
+    monkeypatch.setattr(
+        _impl.logger, "debug", lambda msg, *args: debug.append(msg % args)
+    )
+    # Real captures only grow the totals, one size after another (each with
+    # its eager warmup): the first report is INFO, later one-launch growth
+    # is DEBUG, an unchanged total is not repeated, and a new two-launch
+    # fallback is INFO again.
+    for totals in ((14, 0), (28, 0), (28, 0), (42, 0), (42, 3)):
         counts[0] = totals
         first._prepare_fused_sink_decode(query, True)
         second._prepare_fused_sink_decode(query, False)
         first._prepare_fused_sink_decode(query, False)
-    assert logged == [report.format(14, 0), report.format(14, 3)]
+    assert logged == [report.format(14, 0), report.format(42, 3)]
+    assert debug == [report.format(28, 0), report.format(42, 0)]
     cpu = new_layer()
     cpu._prepare_fused_sink_decode(SimpleNamespace(device=torch.device("cpu")), False)
     assert calls == [query.device] * 2
