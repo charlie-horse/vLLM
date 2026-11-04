@@ -8,10 +8,10 @@
 #               fork. The fork's runtime deps must stay equal to the 1.5.1
 #               wheel's, which ./pyenv/uv.lock pins.
 #   checkpoint  the NVFP4 GGUF converted to a ModelOpt W4A16_NVFP4 checkpoint
-#               by the fork's converter (CPU only), served from the store. The
-#               converter has its own pin (`converterFork`), so a change to
-#               this repo rebuilds only the serving tree, not the 23 GB
-#               checkpoint.
+#               by the fork's converter (CPU only), served from the store. It
+#               is fixed-output (`checkpointHash`), so its store path depends
+#               only on that hash: changes to this repo, the wheel env, LMCache
+#               or nixpkgs never re-convert the 23 GB checkpoint.
 {
   pkgs,
   lib,
@@ -24,13 +24,12 @@
 }:
 let
   # Converter pin: the tree whose vllm.models.flint.convert_gguf produced the
-  # checkpoint. It is fetched, not taken from this repo, because the
-  # checkpoint is input-addressed: any change to the converter's build inputs
-  # gives it a new store path and reconverts (a new 23 GB path; timing at
-  # mkCheckpoint). Only bump it when the converter or the checkpoint format
-  # changes. To bump: set rev, then
+  # checkpoint. It is fetched, not taken from this repo, so the converter
+  # stays fixed while the serving tree moves. Only bump it when the converter
+  # or the checkpoint format changes. To bump: set rev, then
   # `nix flake prefetch --json github:charlie-horse/vLLM/<rev>` and paste its
-  # "hash".
+  # "hash"; the conversion output then changes too, so update checkpointHash
+  # (see mkCheckpoint).
   converterFork = {
     rev = "f66728d9b95e44dd6526b0f2033832477e6a79de"; # claude/flint-v100-pcie
     hash = "sha256-PmWgtyrqJ6KMllN/NqYjhNgrwSypGtQ4xk1BP1ADQfk=";
@@ -237,15 +236,32 @@ in
     version = "1.5.1.dev0+flint.${builtins.substring 0 7 converterFork.rev}";
   };
 
+  # NAR hash of the converted checkpoint. The conversion is deterministic:
+  # builds from two different nixpkgs/toolchains (2026-10 and 2026-11) gave
+  # this same hash.
+  checkpointHash = "sha256-HyBUnISsTQXSKmmOft+/fNzrhFLwBJ6imMCa7YRAwoQ=";
+
   # ~23 GB output, ~25 GB peak RAM. Mostly disk-bound: a few minutes on an
   # SSD; ~15 min on r440's HDDs (2026-11-04, run alone).
-  # Takes the wrapped converterTree (package.nix). Input-addressed: its store
-  # path changes whenever converterTree's derivation does.
+  # Takes the wrapped converterTree (package.nix).
+  #
+  # Fixed-output: the store path depends only on the name and checkpointHash.
+  # - Never re-converts: changes to this repo, the serving tree, the wheel
+  #   env, LMCache, CUDA or nixpkgs, even though they change converterTree's
+  #   derivation. The existing path is reused, or fetched from a cache.
+  # - Re-converts: only when the path is missing everywhere (a new builder
+  #   with no cache), or when checkpointHash changes.
+  # - Change checkpointHash only when converterFork, the GGUF or the config
+  #   pin changes; get the new value from the hash-mismatch error of one build.
+  # The output must not reference store paths (a fixed-output rule).
   mkCheckpoint =
     vllmFlint:
     pkgs.runCommand "flint-nvfp4-modelopt"
       {
         passthru = { inherit gguf hfConfig; };
+        outputHashMode = "recursive";
+        outputHashAlgo = "sha256";
+        outputHash = checkpointHash;
       }
       ''
         export HOME=$TMPDIR HF_HUB_OFFLINE=1 VLLM_NO_USAGE_STATS=1

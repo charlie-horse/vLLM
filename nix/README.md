@@ -24,9 +24,10 @@ Both modules build their packages with the host's `pkgs`, once
   and `.gitignore` (docs are included). Commits that only touch those don't
   rebuild the ~25 min CUDA tree.
 - `flint.nix`: the in-place sm_70 build, the pre-fetched CMake deps, the
-  weights fetches and the conversion. The converter has its own fetched pin
-  (`converterFork`) so the 23 GB checkpoint keeps its store path; bump it only
-  when the converter or the checkpoint format changes.
+  weights fetches and the conversion. The 23 GB checkpoint is fixed-output
+  (`checkpointHash`), so env, LMCache or nixpkgs changes never re-convert it.
+  The converter has its own fetched pin (`converterFork`); bump it, and the
+  hash, only when the converter or the checkpoint format changes.
 - `package.nix`: the uv2nix Python env (`pyenv/`) and the wrappers.
 - `module.nix`, `lmcache.nix`: the service modules.
 - `pyenv/`: `pyproject.toml` + `uv.lock` for the env (torch 2.10+cu128, 1Cat

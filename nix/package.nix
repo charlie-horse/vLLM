@@ -172,7 +172,7 @@ let
       passthru = { inherit tree; };
     };
   # Serving env (this repo) and the converter env (flint.nix `converterFork`),
-  # which only builds the checkpoint.
+  # which only builds the checkpoint (fixed-output, see flint.nix).
   vllmFlint = wrapFlint flint.tree;
   flintConverter = wrapFlint flint.converterTree;
 in
