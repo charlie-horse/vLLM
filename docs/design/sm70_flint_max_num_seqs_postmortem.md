@@ -1,8 +1,8 @@
 # Postmortem: Flint emits gibberish past 64 tokens of context after max-num-seqs 2 → 20
 
-Status: root cause identified; fix on `claude/flint-gpu-opt` (`7f12d21`, plus a
-follow-up that latches the counter allocation per device and stream). Rows
-marked TBD are filled in after deploy.
+Status: resolved. Fixed build deployed on 2026-11-04 at 06:38 EST
+(charlie-horse/vLLM `e66530b`: fix `7f12d21` plus follow-ups through
+`7b2bace`). Open action items are listed below.
 
 ## Summary
 
@@ -10,17 +10,20 @@ On 2026-11-03 c4130's production Flint server was switched to a config with
 `--max-num-seqs 20` (was 2). From then on, every request whose context
 (prompt + generated tokens) passed 64 tokens produced word salad. That held
 at batch 1 too. The post-switch check sent only short answers and passed.
-The regression went unnoticed for about 7 hours, until a user reported it.
+The bad build served for about 2 hours before a user reported it.
 
 ## Impact
 
-- Duration: from gen 40 at 15:41 local (c4130) until rollback or fix (TBD).
+- Duration: wrong output from 15:41 to ~17:35 EST on Nov 3 (about 2 hours),
+  when the production unit was stopped. From 18:19 a hand-run fixed build
+  served on :8000 until the deploy. No system rollback: the user declined it.
 - Scope: every Flint request whose context exceeded 64 tokens. In practice,
   all agent and coding traffic. Only very short chat answers were correct.
-- Data: no corruption outside served responses. LMCache saw 0 hits. Whether
-  it stored bad KV is TBD; if it did, flush it after the fix.
+- Data: no corruption outside served responses. LMCache saw 0 hits. Because it may
+  have stored KV from the bad build, L1 (restart of `vllm-lmcache`) and L2
+  (`/var/lib/lmcache/l2`, 89 GB) were both flushed at deploy.
 
-## Timeline (2026-11-03; times from Ada; c4130 local unless marked)
+## Timeline (EST, c4130 local; from Ada)
 
 | Time | Event |
 | --- | --- |
@@ -28,11 +31,13 @@ The regression went unnoticed for about 7 hours, until a user reported it.
 | — | `maxNumSeqs = 20` added in `charlie-horse/flake` `hosts/c4130/vllm/default.nix` (commit `4155ac6`, "servers" change) |
 | 15:41 | Switch to gen 40; vllm pid 46458 starts |
 | ~15:4x | Post-switch check: 12 concurrent "17×23" requests, ~540 tok/s aggregate, 0 waiting. **All outputs were shorter than 64 tokens** |
-| ~22:30 UTC | Gibberish reported through the orchestrator |
-| 22:3x UTC | Gen 39 and 40 builds found byte-identical; the only delta is `--max-num-seqs` |
-| ~23:00 UTC | Hand-run ablations at seqs 20 (see Root cause) |
-| ~23:20 UTC | Root cause: fused decode counters created under capture; fix `7f12d21` (Tess); ablation table complete |
-| TBD | GPU unit tests, Gate A, review items; merge; deploy; LMCache flush |
+| Nov 3 ~17:30 | Gibberish reported through the orchestrator |
+| ~17:35 | Production unit stopped. Gen 39 and 40 builds found byte-identical; the only delta is `--max-num-seqs` |
+| ~18:00 | Hand-run ablations at seqs 20 (see Root cause) |
+| ~18:19 | Root cause: fused decode counters created under capture. Fix `7f12d21` (Tess) hand-run as the interim server on :8000 |
+| ~19:28 | Interim server moved to follow-up `7b2bace` (counter allocation latched per device and stream) |
+| Nov 4 06:38 | Deploy: NixOS gen `chl9lk9m…`, flake `9bc080e`, fork `e66530b`; LMCache L1 and L2 flushed |
+| 06:43 | Serving. Fresh and prefix-hit repeat probe matrix coherent; 49/49 layers on the one-launch path; 175 tok/s |
 
 ## Symptoms and repro
 
@@ -110,6 +115,14 @@ follow-up commit latches the allocation per (device, stream). 175 against
 - **No continuous quality signal.** Nothing in production samples output
   quality. The first signal was a person.
 
+## Related incidents during the deploy
+
+- A `prompt_logprobs` out-of-memory error (separate ticket).
+- The r440 build host hung on memory exhaustion from parallel CUDA
+  pre-builds. It is now hardened: Nix `max-jobs 1`, nix-daemon `MemoryMax`
+  36G, zram, and LMCache `MAX_JOBS` following the core count (fork branch
+  `claude/nix-flake` `23ea1b6`, not yet merged).
+
 ## What went well
 
 - The gen 39/40 build diff ruled out the build in minutes, thanks to the
@@ -123,14 +136,14 @@ follow-up commit latches the allocation per (device, stream). 175 against
 | # | Action | Owner | Status |
 | --- | --- | --- | --- |
 | 1 | Fix the root cause, with a unit test for descending capture with growth | Ada / Tess | Done in `7f12d21`; GPU tests not yet run (no pytest on c4130) |
-| 1b | Make the fused path independent of the warm-up count (latch per device and stream); test warm-ups 0 and 1, eager on the default stream with capture on a side stream; count fallbacks in `/v1/sm70/acceleration` | Dennis / Ada | Follow-up commit; fallback warning seen 0 times today |
+| 1b | Make the fused path independent of the warm-up count (latch per device and stream); test warm-ups 0 and 1, eager on the default stream with capture on a side stream; count fallbacks in `/v1/sm70/acceleration` | Dennis / Ada | Done in `7b2bace`; 49/49 one-launch capture report at deploy |
 | 2 | Regression test: greedy to 256 tokens with prompts of 3, 60, 100 and 1000 tokens, each sent twice (prefix-cache hit), at batch 1 and 8, on a server at max-num-seqs 20 with default graphs plus an `--enforce-eager` variant, compared with known-good output | Ada / Ken | Planned |
-| 3 | **Mandatory long-generation smoke test in the switch runbook.** After every serving-config change, before the switch counts as done: (a) a ≥ 1,000-token prompt that needs a specific answer (needle or a code task with asserts), (b) one greedy generation to ≥ 256 tokens compared with a stored golden output, (c) one batch of concurrent requests at the new max-num-seqs. Fail means automatic rollback | Ken | In the playbook (Phase 5, switch smoke test); runbook TBD |
+| 3 | **Mandatory long-generation smoke test in the switch runbook.** After every serving-config change, before the switch counts as done: (a) a ≥ 1,000-token prompt that needs a specific answer (needle or a code task with asserts), (b) one greedy generation to ≥ 256 tokens compared with a stored golden output, (c) one batch of concurrent requests at the new max-num-seqs. Fail means automatic rollback | Ken | In the playbook (Phase 5, switch smoke test); runbook open |
 | 4 | Treat `max-num-seqs`, `max-num-batched-tokens`, graph sizes, `max-model-len`, KV dtype and attention backend as code changes: run the validation runbook's `smoke,quality` stages at the new value before deploying | Coordinator | In the playbook (Phase 4, serving-config sweep) |
-| 5 | Add a max-num-seqs and capture-size sweep (2, 3, 4, 8, 20, plus the default capture list) to `tools/flint/sm70_validate.sh` and to the playbook's Phase 4 | Ken | Playbook done; `sm70_validate.sh` TBD |
-| 6 | Production quality canary: every N minutes, one fixed greedy long prompt against the golden output; alert on mismatch beyond the noise floor | Ken | TBD |
-| 7 | Audit every lazily allocated "zero once" or "fill once" buffer reachable under capture, and every batch-admitted SM70 path, for state sized at init or capture (workspaces, counters, CTA counts) against the live batch and capture size | Dennis / Hedy | TBD |
-| 8 | Flush LMCache L1 after the fix, if it stored KV computed by the bad build | Coordinator | TBD |
+| 5 | Add a max-num-seqs and capture-size sweep (2, 3, 4, 8, 20, plus the default capture list) to `tools/flint/sm70_validate.sh` and to the playbook's Phase 4 | Ken | Playbook done; `sm70_validate.sh` open |
+| 6 | Production quality canary: every N minutes, one fixed greedy long prompt against the golden output; alert on mismatch beyond the noise floor | Ken | Open |
+| 7 | Audit every lazily allocated "zero once" or "fill once" buffer reachable under capture, and every batch-admitted SM70 path, for state sized at init or capture (workspaces, counters, CTA counts) against the live batch and capture size | Dennis / Hedy | Open |
+| 8 | Flush LMCache after the fix | Ada | Done: L1 and L2 flushed at deploy |
 
 ## Lessons
 
