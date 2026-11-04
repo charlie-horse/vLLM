@@ -43,27 +43,22 @@ from vllm.v1.attention.ops.sm70_grouped import (
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
-# Set while sink layers are being captured; the next eager forward reports
-# how the captured graphs decode the grouped sink layers. The last counts
-# reported, so each distinct total is logged once.
-_SINK_CAPTURE_PENDING = [False]
-_SINK_CAPTURE_REPORTED: list[tuple[int, int] | None] = [None]
+# Process-wide: the model runner reports once after capture_model, however
+# many attention layers (and impl instances) share this backend.
+_SINK_CAPTURE_REPORTED = [False]
 
 
 def _log_sink_capture_summary(counts) -> None:
-    if counts is None:
+    if counts is None or _SINK_CAPTURE_REPORTED[0]:
         return
     totals = tuple(counts())
-    previous = _SINK_CAPTURE_REPORTED[0]
-    if not any(totals) or totals == previous:
+    if not any(totals):
         return
-    _SINK_CAPTURE_REPORTED[0] = totals
-    # The totals grow with every captured size, so INFO only for the first
-    # report or a new two-launch fallback; later growth goes to DEBUG. Each
-    # fallback already warned with its reason when it was captured.
-    first_or_fallback = previous is None or totals[1] != previous[1]
-    (logger.info if first_or_fallback else logger.debug)(
-        "Flash-V100 grouped sink decode in captured CUDA graphs so far: %d "
+    _SINK_CAPTURE_REPORTED[0] = True
+    # INFO once per process; each two-launch fallback already warned with
+    # its reason when it was captured.
+    logger.info(
+        "Flash-V100 grouped sink decode in captured CUDA graphs: %d "
         "one-launch, %d two-launch (partition kernel plus reducer).",
         *totals,
     )
@@ -902,21 +897,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         without capture warmups) asks for them; prepare is an idempotent
         cache lookup that allocates them, zeroed, once per device, and a
         no-op when VLLM_SM70_FLINT_ATTN_FUSED_DECODE=0. Under capture nothing
-        is allocated: a graph without counters decodes with two launches. The
-        first eager forward after a capture reports new capture totals.
+        is allocated: a graph without counters decodes with two launches.
+        after_cudagraph_capture reports the capture totals.
         """
-        if is_capturing:
-            _SINK_CAPTURE_PENDING[0] = True
-            return
-        if _SINK_CAPTURE_PENDING[0]:
-            _SINK_CAPTURE_PENDING[0] = False
-            _log_sink_capture_summary(self.flash_attn_decode_paged_sinks_capture_counts)
-        if self._flash_v100_fused_decode_ready:
+        if is_capturing or self._flash_v100_fused_decode_ready:
             return
         self._flash_v100_fused_decode_ready = True
         prepare = self.flash_attn_decode_paged_sinks_prepare
         if prepare is not None and query.device.type == "cuda":
             prepare(query.device)
+
+    def after_cudagraph_capture(self) -> None:
+        """Model-runner hook, called once capture_model has finished: log
+        how the captured graphs decode the grouped sink layers."""
+        _log_sink_capture_summary(self.flash_attn_decode_paged_sinks_capture_counts)
 
     def forward(
         self,
@@ -940,10 +934,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         """
 
         is_capturing = _routing.is_cuda_graph_capturing(query)
-        if self._flash_v100_sinks is not None and (
-            is_capturing
-            or _SINK_CAPTURE_PENDING[0]
-            or not self._flash_v100_fused_decode_ready
+        if (
+            self._flash_v100_sinks is not None
+            and not self._flash_v100_fused_decode_ready
         ):
             self._prepare_fused_sink_decode(query, is_capturing)
         if attn_metadata is None:

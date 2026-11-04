@@ -11993,7 +11993,21 @@ class GPUModelRunner(
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        self._notify_attention_capture_finished()
         return cuda_graph_size
+
+    def _notify_attention_capture_finished(self) -> None:
+        """Let attention impls report on the graphs just captured, once per
+        impl type (an impl opts in with an after_cudagraph_capture method)."""
+        seen: set[type] = set()
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        for layer in layers.values():
+            impl = getattr(layer, "impl", None)
+            hook = getattr(impl, "after_cudagraph_capture", None)
+            if hook is None or type(impl) in seen:
+                continue
+            seen.add(type(impl))
+            hook()
 
     def _warmup_and_capture(
         self,

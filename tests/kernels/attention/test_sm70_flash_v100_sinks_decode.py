@@ -1139,61 +1139,95 @@ def test_fused_counters_optional_per_launch_zero(cpu_interface, monkeypatch):
 
 def test_impl_prepares_fused_counters_once_per_layer(monkeypatch):
     """Each sink layer's first eager forward asks for the device's counters
-    once (prepare itself is an idempotent per-device lookup); the first eager
-    forward after a capture reports new capture totals, once per total."""
+    once (prepare itself is an idempotent per-device lookup); nothing is
+    allocated or reported under capture."""
     from vllm.v1.attention.backends.flash_v100 import impl as _impl
 
     calls: list[torch.device] = []
-    counts = [(0, 0)]
     logged: list[str] = []
-    monkeypatch.setattr(_impl, "_SINK_CAPTURE_PENDING", [False])
-    monkeypatch.setattr(_impl, "_SINK_CAPTURE_REPORTED", [None])
+    monkeypatch.setattr(_impl, "_SINK_CAPTURE_REPORTED", [False])
     monkeypatch.setattr(
         _impl.logger, "info", lambda msg, *args: logged.append(msg % args)
-    )
-    monkeypatch.setattr(
-        _impl.logger, "warning", lambda msg, *args: logged.append("W " + msg % args)
     )
 
     def new_layer():
         layer = _impl.FlashAttnV100Impl.__new__(_impl.FlashAttnV100Impl)
         layer.flash_attn_decode_paged_sinks_prepare = calls.append
-        layer.flash_attn_decode_paged_sinks_capture_counts = lambda: counts[0]
+        layer.flash_attn_decode_paged_sinks_capture_counts = lambda: (14, 0)
         layer._flash_v100_sinks = torch.zeros(16, dtype=torch.float32)
         return layer
 
     first, second = new_layer(), new_layer()
     query = SimpleNamespace(device=torch.device("cuda", 0))
     first._prepare_fused_sink_decode(query, True)
-    assert calls == []  # under capture: nothing allocated
+    assert calls == [] and not first._flash_v100_fused_decode_ready
     first._prepare_fused_sink_decode(query, False)  # profile run
     first._prepare_fused_sink_decode(query, False)
     second._prepare_fused_sink_decode(query, False)
     assert calls == [query.device] * 2
     assert first._flash_v100_fused_decode_ready
-    assert logged == []  # nothing captured yet: (0, 0) is not reported
-    report = (
-        "Flash-V100 grouped sink decode in captured CUDA graphs so far: "
-        "{} one-launch, {} two-launch (partition kernel plus reducer)."
-    )
-    debug: list[str] = []
-    monkeypatch.setattr(
-        _impl.logger, "debug", lambda msg, *args: debug.append(msg % args)
-    )
-    # Real captures only grow the totals, one size after another (each with
-    # its eager warmup): the first report is INFO, later one-launch growth
-    # is DEBUG, an unchanged total is not repeated, and a new two-launch
-    # fallback is INFO again.
-    for totals in ((14, 0), (28, 0), (28, 0), (42, 0), (42, 3)):
-        counts[0] = totals
-        first._prepare_fused_sink_decode(query, True)
-        second._prepare_fused_sink_decode(query, False)
-        first._prepare_fused_sink_decode(query, False)
-    assert logged == [report.format(14, 0), report.format(42, 3)]
-    assert debug == [report.format(28, 0), report.format(42, 0)]
+    assert logged == []  # forwards never report; the runner hook does
     cpu = new_layer()
     cpu._prepare_fused_sink_decode(SimpleNamespace(device=torch.device("cpu")), False)
     assert calls == [query.device] * 2
+
+
+def test_after_cudagraph_capture_reports_once(monkeypatch):
+    """The model runner's post-capture hook logs the final totals once per
+    process at INFO, and nothing when no grouped sink decode was captured."""
+    from vllm.v1.attention.backends.flash_v100 import impl as _impl
+
+    logged: list[str] = []
+    counts = [(0, 0)]
+    monkeypatch.setattr(_impl, "_SINK_CAPTURE_REPORTED", [False])
+    monkeypatch.setattr(
+        _impl.logger, "info", lambda msg, *args: logged.append(msg % args)
+    )
+    layer = _impl.FlashAttnV100Impl.__new__(_impl.FlashAttnV100Impl)
+    layer.flash_attn_decode_paged_sinks_capture_counts = lambda: counts[0]
+    layer.after_cudagraph_capture()
+    assert logged == []  # nothing captured (or the kill switch): silent
+    counts[0] = (98, 0)
+    layer.after_cudagraph_capture()
+    layer.after_cudagraph_capture()
+    assert logged == [
+        "Flash-V100 grouped sink decode in captured CUDA graphs: 98 one-launch, "
+        "0 two-launch (partition kernel plus reducer)."
+    ]
+    no_ops = _impl.FlashAttnV100Impl.__new__(_impl.FlashAttnV100Impl)
+    no_ops.after_cudagraph_capture()  # extension without the counts op
+    assert len(logged) == 1
+
+
+def test_runner_notifies_attention_once_per_impl_type(monkeypatch):
+    """capture_model's hook calls after_cudagraph_capture once per impl type
+    and skips impls without it."""
+    from vllm.v1.worker import gpu_model_runner as runner_mod
+
+    calls: list[str] = []
+
+    class Reporting:
+        def __init__(self, name):
+            self.name = name
+
+        def after_cudagraph_capture(self):
+            calls.append(self.name)
+
+    class Silent:
+        pass
+
+    layers = {
+        "a": SimpleNamespace(impl=Reporting("a")),
+        "b": SimpleNamespace(impl=Silent()),
+        "c": SimpleNamespace(impl=Reporting("c")),
+        "d": SimpleNamespace(impl=None),
+    }
+    monkeypatch.setattr(
+        runner_mod, "get_layers_from_vllm_config", lambda cfg, cls: layers
+    )
+    fake = SimpleNamespace(vllm_config=None)
+    runner_mod.GPUModelRunner._notify_attention_capture_finished(fake)
+    assert calls == ["a"]
 
 
 def test_impl_forward_skips_the_hook_once_ready(monkeypatch):
@@ -1203,7 +1237,6 @@ def test_impl_forward_skips_the_hook_once_ready(monkeypatch):
 
     entered: list[bool] = []
     probes: list[object] = []
-    monkeypatch.setattr(_impl, "_SINK_CAPTURE_PENDING", [False])
 
     def probe(tensor) -> bool:
         probes.append(tensor)
@@ -1232,9 +1265,6 @@ def test_impl_forward_skips_the_hook_once_ready(monkeypatch):
     layer._flash_v100_fused_decode_ready = True
     forward()
     assert entered == [False] and len(probes) == 3
-    _impl._SINK_CAPTURE_PENDING[0] = True
-    forward()
-    assert entered == [False, False]
 
 
 def test_fused_decode_capture_counts(cpu_interface, monkeypatch):
