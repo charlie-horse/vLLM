@@ -35,6 +35,11 @@ let
     hash = "sha256-PmWgtyrqJ6KMllN/NqYjhNgrwSypGtQ4xk1BP1ADQfk=";
   };
 
+  # NAR hash of the converted Flint checkpoint. The conversion is deterministic:
+  # builds from two different nixpkgs/toolchains (2026-10 and 2026-11) gave
+  # this same hash.
+  checkpointHash = "sha256-HyBUnISsTQXSKmmOft+/fNzrhFLwBJ6imMCa7YRAwoQ=";
+
   # Weights pins (Hugging Face commits; neither repo is gated).
   ggufRepo = {
     repo = "RecursiveSI/flint-nvfp4-gguf";
@@ -235,11 +240,6 @@ in
     src = fetchFork converterFork;
     version = "1.5.1.dev0+flint.${builtins.substring 0 7 converterFork.rev}";
   };
-
-  # NAR hash of the converted checkpoint. The conversion is deterministic:
-  # builds from two different nixpkgs/toolchains (2026-10 and 2026-11) gave
-  # this same hash.
-  checkpointHash = "sha256-HyBUnISsTQXSKmmOft+/fNzrhFLwBJ6imMCa7YRAwoQ=";
 
   # ~23 GB output, ~25 GB peak RAM. Mostly disk-bound: a few minutes on an
   # SSD; ~15 min on r440's HDDs (2026-11-04, run alone).
